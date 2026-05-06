@@ -2,7 +2,7 @@ import os
 
 API_URL = "https://fapi.binance.com"
 ACCOUNT_RISK_PERCENT = 0.02  
-MAX_POSITIONS = 5            
+MAX_POSITIONS = 3            
 MAX_LEVERAGE = 20
             
 USE_BTC_FILTER = False

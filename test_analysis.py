@@ -22,6 +22,10 @@ async def test_full_analysis(symbol="BTCUSDT"):
                 print(f"   Signal: {result['sig']}")
                 print(f"   Score: {result['score']}")
                 print(f"   Price: {result['price']}")
+                print(f"   Limit Price: {result.get('limit', 'N/A')}")
+                print(f"   Structure: {result.get('struct', 'N/A')}")
+                print(f"   Regime: {result.get('regime', 'N/A')}")
+                print(f"   AI Brain: {result.get('ai', 'N/A')}")
             else:
                 print("❌ Analysis returned NONE.")
                 # Let's check why by inspecting market_data

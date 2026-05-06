@@ -3,7 +3,7 @@ import httpx
 import asyncio
 import urllib.parse
 from utils.config import API_URL, API_KEY, API_SECRET
-from utils.state import bot_state, symbol_info_cache
+from utils.state import bot_state, symbol_info_cache, market_data
 from utils.helpers import get_signature
 from utils.logger import log_error
 
@@ -38,7 +38,13 @@ async def binance_request(client, method, endpoint, params=None):
                 raise httpx.HTTPStatusError(f"Server Error {res.status_code}", request=None, response=res)
             else:
                 if res.status_code == 400:
-                    log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
+                    try:
+                        err_data = res.json()
+                        if err_data.get("code") == -4130:
+                            return res # Silent return for existing SL/TP
+                        log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
+                    except:
+                        log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
                 else:
                     log_error(f"API Error {res.status_code} for {endpoint}", include_traceback=False)
                 return res
@@ -147,11 +153,16 @@ async def get_orderbook_imbalance(client, symbol):
         if res.status_code == 200:
             data = res.json()
             bids = sum(float(b[1]) for b in data['bids'])
-            asks = sum(float(a[1]) for b in data['asks'])
-            ratio = bids / asks if asks > 0 else 1.0
-            market_data.imbalance[symbol] = ratio
-            return ratio
-    except: pass
+            asks = sum(float(a[1]) for a in data['asks'])
+            
+            # Calculate imbalance ratio (Bids / Asks)
+            # > 1 means more bids (buying pressure), < 1 means more asks (selling pressure)
+            if asks == 0: asks = 1 # Prevent division by zero
+            imbalance = bids / asks
+            market_data.imbalance[symbol] = imbalance
+            return imbalance
+    except Exception as e:
+        log_error(f"Orderbook Imbalance Error ({symbol}): {str(e)}")
     return 1.0
 
 async def get_btc_dominance(client):

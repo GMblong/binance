@@ -6,3 +6,5 @@ rich
 numpy
 scikit-learn
 xgboost
+lightgbm
+optuna

@@ -17,8 +17,18 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         
         # Risk Management: Calculate Quantity
         balance = bot_state["balance"]
-        risk_amt = balance * ACCOUNT_RISK_PERCENT
-        sl_pct = ai_brain["sl"]
+        base_risk = balance * ACCOUNT_RISK_PERCENT
+        
+        # --- DYNAMIC POSITION SIZING ---
+        ml_prob = ai_brain.get("ml_prob", 0.5)
+        if ml_prob > 0.75 or ml_prob < 0.25:
+            risk_amt = base_risk * 1.2 # 120% of normal risk for high conviction
+        elif ml_prob >= 0.6 or ml_prob <= 0.4:
+            risk_amt = base_risk # 100% of normal risk
+        else:
+            risk_amt = base_risk * 0.5 # 50% of normal risk for low conviction
+
+        sl_pct = max(0.1, ai_brain.get("sl", 1.0)) # Safety: Min 0.1% SL
         
         # Quantity = Risk Amount / (Price * SL%)
         quantity = risk_amt / (limit_price * (sl_pct / 100))
@@ -35,44 +45,63 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         if quantity <= 0: return False
 
         limit_price_str = f"{limit_price:.{prec['p_prec']}f}"
+
+        # --- ORDER EXECUTION (MARKET vs LIMIT) ---
+        is_market = ai_brain.get("is_market", False)
+        order_type = "MARKET" if is_market else "LIMIT"
         
-        # PLACE LIMIT ORDER
-        res = await binance_request(client, 'POST', '/fapi/v1/order', {
-            "symbol": symbol, "side": side, "type": "LIMIT",
-            "quantity": f"{quantity:.{prec['q_prec']}f}", 
-            "price": limit_price_str, 
-            "timeInForce": "GTC"
-        })
+        order_params = {
+            "symbol": symbol, "side": side, "type": order_type,
+            "quantity": f"{quantity:.{prec['q_prec']}f}"
+        }
+        
+        if not is_market:
+            order_params["price"] = limit_price_str
+            order_params["timeInForce"] = "GTC"
+        
+        res = await binance_request(client, 'POST', '/fapi/v1/order', order_params)
         
         if res and res.status_code == 200:
             order_data = res.json()
-            bot_state["last_log"] = f"[bold cyan]LIMIT {side} {symbol} at {limit_price_str}[/]"
+            # For market orders, use the actual fill price if available, else curr_price
+            execution_price = float(order_data.get("avgPrice", 0)) or curr_price
+            if is_market:
+                bot_state["last_log"] = f"[bold magenta]MARKET {side} {symbol} at {execution_price:.{prec['p_prec']}f}[/]"
+            else:
+                bot_state["last_log"] = f"[bold cyan]LIMIT {side} {symbol} at {limit_price_str}[/]"
             
             # --- PLACE SERVER-SIDE SL & TP ---
             try:
-                # Format prices with exact precision to avoid code -4014
+                # Use execution price for SL/TP calculation
+                ref_price = execution_price if is_market else limit_price
+                
                 sl_mult = (1 - (ai_brain["sl"]/100)) if side == "BUY" else (1 + (ai_brain["sl"]/100))
-                sl_price = round_step(limit_price * sl_mult, prec["tick"])
+                sl_price = round_step(ref_price * sl_mult, prec["tick"])
                 sl_price_str = f"{sl_price:.{prec['p_prec']}f}"
 
                 tp_mult = (1 + (ai_brain["tp"]/100)) if side == "BUY" else (1 - (ai_brain["tp"]/100))
-                tp_price = round_step(limit_price * tp_mult, prec["tick"])
+                tp_price = round_step(ref_price * tp_mult, prec["tick"])
                 tp_price_str = f"{tp_price:.{prec['p_prec']}f}"
 
                 # Use STOP_MARKET / TAKE_PROFIT_MARKET but with precise formatting
-                await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                sl_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
                     "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
                     "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": sl_price_str, 
                     "closePosition": "true", "workingType": "MARK_PRICE"
                 })
 
-                await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                tp_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
                     "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
                     "type": "TAKE_PROFIT_MARKET", "algoType": "CONDITIONAL", "triggerPrice": tp_price_str, 
                     "closePosition": "true", "workingType": "MARK_PRICE"
                 })
+                
+                if sl_res and sl_res.status_code != 200:
+                    err_msg = sl_res.json().get("msg", "")
+                    if "existing" not in err_msg.lower():
+                        log_error(f"SL Placement Fail for {symbol}: {err_msg}")
             except Exception as e:
-                log_error(f"SL/TP Placement Fail for {symbol}: {str(e)}")
+                log_error(f"SL/TP Placement Exception for {symbol}: {str(e)}")
             
             bot_state["limit_orders"][symbol] = {
                 "orderId": order_data["orderId"],
@@ -207,18 +236,25 @@ async def manage_active_positions(client, all_signals):
             trail_act = ai.get("ts_act", 0.8)
             base_cb = ai.get("ts_cb", 0.25)
             
-            # --- SMART DYNAMIC TRAILING STOP (TIERED) ---
-            # As the profit grows larger, we tighten the callback to lock in more profit
-            current_cb = base_cb
+            # --- VOLATILITY-ADJUSTED DYNAMIC TRAILING STOP ---
+            # Adjust callback based on global market volatility to avoid being stopped out by noise
+            market_vol = bot_state.get("market_vol", 1.0)
+            vol_multiplier = min(max(market_vol, 0.5), 2.0) # Cap multiplier between 0.5x and 2x
+            
+            # Base callback is expanded in high volatility, tightened in low volatility
+            dynamic_cb = base_cb * vol_multiplier
+            
+            # As profit grows larger, tighten the callback to lock in profit (Tiered + Volatility aware)
+            current_cb = dynamic_cb
             if peak_pnl >= trail_act * 3:
-                current_cb = base_cb * 0.3  # Super tight (30% of original cb) if 3x target
+                current_cb = dynamic_cb * 0.3  # Super tight (30%) if 3x target
             elif peak_pnl >= trail_act * 2:
-                current_cb = base_cb * 0.6  # Medium tight (60% of original cb) if 2x target
+                current_cb = dynamic_cb * 0.6  # Medium tight (60%) if 2x target
             elif peak_pnl >= trail_act * 1.5:
-                current_cb = base_cb * 0.8  # Slightly tight if 1.5x target
+                current_cb = dynamic_cb * 0.8  # Slightly tight if 1.5x target
                 
             if peak_pnl >= trail_act and (peak_pnl - pnl_pct) >= current_cb:
-                reason = f"AI-TRAIL {pnl_pct:.2f}%"
+                reason = f"AI-TRAIL {pnl_pct:.2f}% (CB: {current_cb:.2f}%)"
                 
             # Smart Exit / Reversal Detection
             if EXIT_ON_REVERSAL and not reason:

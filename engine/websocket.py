@@ -135,15 +135,40 @@ class WebSocketManager:
                                                 bot_state["balance"] = float(asset["wb"])
                                     elif event_type == "ORDER_TRADE_UPDATE":
                                         o = data["o"]
+                                        sym = o['s']
+                                        oid = o['i']
+                                        
+                                        # 1. Update Daily PnL on every trade execution
+                                        if o.get("x") == "TRADE":
+                                            trade_rp = float(o.get("rp", 0))
+                                            if trade_rp != 0:
+                                                bot_state["daily_pnl"] = bot_state.get("daily_pnl", 0.0) + trade_rp
+                                        
+                                        # 2. Handle W/L and Logging on FILLED or significant TRADE
                                         if o["X"] == "FILLED":
-                                            bot_state["last_log"] = f"[bold green]WS: {o['s']} Filled at {o['L']}[/]"
-                                            rp = float(o.get("rp", 0))
-                                            if rp != 0:
-                                                bot_state["daily_pnl"] = bot_state.get("daily_pnl", 0.0) + rp
-                                                if rp > 0:
-                                                    bot_state["wins"] = bot_state.get("wins", 0) + 1
-                                                elif rp < 0:
-                                                    bot_state["losses"] = bot_state.get("losses", 0) + 1
+                                            bot_state["last_log"] = f"[bold green]WS: {sym} Filled at {o['L']}[/]"
+                                            
+                                            # Avoid double counting W/L for the same order
+                                            if not hasattr(self, '_processed_orders'): self._processed_orders = set()
+                                            if oid not in self._processed_orders:
+                                                rp = float(o.get("rp", 0))
+                                                # If rp is 0 on the final fill, it might have been in partials, 
+                                                # but for simplicity we count it if non-zero.
+                                                if rp != 0:
+                                                    self._processed_orders.add(oid)
+                                                    if len(self._processed_orders) > 200: self._processed_orders.pop() # Keep it small
+                                                    
+                                                    if rp > 0:
+                                                        bot_state["wins"] = bot_state.get("wins", 0) + 1
+                                                        if sym not in bot_state["sym_perf"]: bot_state["sym_perf"][sym] = {'w':0, 'l':0, 'c':0}
+                                                        bot_state["sym_perf"][sym]['w'] += 1
+                                                        bot_state["sym_perf"][sym]['c'] = 0
+                                                    else:
+                                                        bot_state["losses"] = bot_state.get("losses", 0) + 1
+                                                        if sym not in bot_state["sym_perf"]: bot_state["sym_perf"][sym] = {'w':0, 'l':0, 'c':0}
+                                                        bot_state["sym_perf"][sym]['l'] += 1
+                                                        bot_state["sym_perf"][sym]['c'] += 1
+                                                        bot_state["sym_perf"][sym]['last_loss_time'] = time.time()
 
                                 # 2. Market Data
                                 elif "@ticker" in stream_name:

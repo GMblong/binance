@@ -41,6 +41,11 @@ async def trading_loop(client):
             
             # 1. Slow Cycle: BTC Trend and Full Ticker Refresh (Every 5 mins)
             is_ws_stale = (now - bot_state.get("ws_last_msg", 0)) > 30
+            
+            # Periodically sync balance (every ~7.5 seconds) to ensure real-time UI match
+            if loop_count % 5 == 0:
+                await get_balance_async(client)
+
             if loop_count % 300 == 0 or not market_data.tickers or is_ws_stale:
                 await get_btc_trend(client)
                 ticker_res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
@@ -75,7 +80,7 @@ async def trading_loop(client):
             
             # TURBO UI Placeholder
             placeholder_results = []
-            for t in top_movers:
+            for t in top_movers[:5]: # Display top 5 in UI
                 sym_full = t["s"]
                 k = market_data.klines.get(sym_full, {})
                 status = "SYNC (1m)" if "1m" not in k else "READY"
@@ -100,21 +105,32 @@ async def trading_loop(client):
             net_bias = sum([1 if float(p['positionAmt']) > 0 else -1 for p in active_pos])
             bot_state["directional_bias"] = net_bias
 
-            # 5. Analysis Phase (Serial and Careful)
-            final_symbols = list(set(top_symbols + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
+            # 5. Analysis Phase (Concurrent and Smart)
+            final_symbols = list(set(top_symbols[:5] + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
             market_data.current_scan_list = final_symbols
             
+            # Fetch institutional data (OI & Funding) periodically
+            if loop_count % 5 == 0:
+                await get_market_depth_data(client, final_symbols)
+            
+            # Concurrently analyze symbols
+            tasks = [analyze_hybrid_async(client, s) for s in final_symbols]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
             analysis_results = []
-            for s in final_symbols:
-                res = await analyze_hybrid_async(client, s)
-                if res: analysis_results.append(res)
+            for res in results:
+                if isinstance(res, Exception):
+                    log_error(f"Concurrent Analysis Error: {str(res)}")
+                elif res:
+                    analysis_results.append(res)
             
             if analysis_results:
-                # Merge and Sort
+                # Merge and Sort: Add placeholder only if the symbol isn't already successfully analyzed
                 existing_syms = [r["sym"] for r in analysis_results]
                 for p in placeholder_results:
-                    if p["sym"] not in existing_syms: analysis_results.append(p)
-                bot_state["last_scan_results"] = sorted(analysis_results, key=lambda x: x.get('score', 0), reverse=True)
+                    if p["sym"] not in existing_syms: 
+                        analysis_results.append(p)
+                bot_state["last_scan_results"] = sorted(analysis_results, key=lambda x: x.get('score', -1), reverse=True)
             
             # 6. Execution Phase
             if not bot_state.get("is_passive", False):
