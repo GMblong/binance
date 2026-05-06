@@ -12,13 +12,14 @@ import pandas as pd
 class WebSocketManager:
     def __init__(self):
         # Base URI for targeted streams
-        self.base_uri = "wss://fstream.binancefuture.com/stream"
+        self.base_uri = "wss://fstream.binance.com"
         self.running = True
         self.last_msg_time = 0
         self.msg_count = 0
         self.reconnect_count = 0
         self.active_streams = set()
         self.ws = None
+        self.listen_key = None
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
@@ -63,28 +64,44 @@ class WebSocketManager:
                 for s in to_unsubscribe: self.active_streams.discard(s)
             except: pass
 
-    async def start(self):
+    async def start(self, client):
+        from engine.api import get_listen_key, keep_alive_listen_key
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
         while self.running:
             try:
+                self.listen_key = await get_listen_key(client)
+                if not self.listen_key:
+                    await asyncio.sleep(5)
+                    continue
+
+                # Combine listenKey with market streams for single connection
+                uri = f"{self.base_uri}/stream?streams={self.listen_key}"
+                
                 bot_state["last_log"] = f"[bold yellow]WS Connecting...[/]"
                 async with connect(
-                    self.base_uri,
+                    uri,
                     ssl=ssl_context,
                     additional_headers=self.headers,
-                    # Disable internal ping for Termux stability, let the server or TCP handle it
                     ping_interval=None, 
-                    max_size=2**22 # 4MB buffer is plenty for targeted streams
+                    max_size=2**22 
                 ) as ws:
                     self.ws = ws
                     self.reconnect_count = 0
                     bot_state["ws_online"] = True
-                    bot_state["last_log"] = "[bold cyan]WS Connected (Targeted Mode)[/]"
+                    bot_state["last_log"] = "[bold cyan]WS Connected (User + Market Data)[/]"
                     
-                    # Re-subscribe to previously active streams if any
+                    # Start ListenKey Keep-Alive Task
+                    async def keep_alive_task():
+                        while self.ws and self.ws.state == State.OPEN:
+                            await asyncio.sleep(1800) # 30 minutes
+                            await keep_alive_listen_key(client, self.listen_key)
+                    
+                    ka_task = asyncio.create_task(keep_alive_task())
+
+                    # Re-subscribe to previously active market streams
                     if self.active_streams:
                         streams = list(self.active_streams)
                         for i in range(0, len(streams), 20):
@@ -104,32 +121,46 @@ class WebSocketManager:
                             bot_state["ws_last_msg"] = self.last_msg_time
                             
                             raw_data = json.loads(msg)
-                            stream_name = raw_data.get("stream", "")
-                            data = raw_data.get("data")
-                            if not data: continue
-
-                            # 1. Handle Targeted Ticker
-                            if "@ticker" in stream_name:
-                                s = data['s']
-                                p = float(data['c'])
-                                market_data.prices[s] = p
-                                # Note: global market_data.tickers list will be maintained by REST fallback
-                                # to ensure we always have the top mover context.
                             
-                            # 2. Handle Real-time Klines
-                            elif "@kline_" in stream_name:
-                                s = data['s']
-                                k = data['k']
-                                await market_data.update_kline(s, k['i'], {
-                                    "ot": k['t'], "o": float(k['o']), "h": float(k['h']),
-                                    "l": float(k['l']), "c": float(k['c']),
-                                    "v": float(k['v']), "tbv": float(k['V'])
-                                })
+                            if "stream" in raw_data:
+                                stream_name = raw_data["stream"]
+                                data = raw_data["data"]
+                                
+                                # 1. User Data (ListenKey Stream)
+                                if stream_name == self.listen_key:
+                                    event_type = data.get("e")
+                                    if event_type == "ACCOUNT_UPDATE":
+                                        for asset in data.get("a", {}).get("B", []):
+                                            if asset["a"] == "USDT":
+                                                bot_state["balance"] = float(asset["wb"])
+                                    elif event_type == "ORDER_TRADE_UPDATE":
+                                        o = data["o"]
+                                        if o["X"] == "FILLED":
+                                            bot_state["last_log"] = f"[bold green]WS: {o['s']} Filled at {o['L']}[/]"
+                                            rp = float(o.get("rp", 0))
+                                            if rp != 0:
+                                                bot_state["daily_pnl"] = bot_state.get("daily_pnl", 0.0) + rp
+                                                if rp > 0:
+                                                    bot_state["wins"] = bot_state.get("wins", 0) + 1
+                                                elif rp < 0:
+                                                    bot_state["losses"] = bot_state.get("losses", 0) + 1
+
+                                # 2. Market Data
+                                elif "@ticker" in stream_name:
+                                    market_data.prices[data['s']] = float(data['c'])
+                                elif "@kline_" in stream_name:
+                                    k = data['k']
+                                    await market_data.update_kline(data['s'], k['i'], {
+                                        "ot": k['t'], "o": float(k['o']), "h": float(k['h']),
+                                        "l": float(k['l']), "c": float(k['c']),
+                                        "v": float(k['v']), "tbv": float(k['V'])
+                                    })
 
                             if self.msg_count % 100 == 0:
                                 bot_state["last_log"] = f"[bold green]WS Live: {self.msg_count} pkts | {len(self.active_streams)} streams[/]"
 
                         except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                            ka_task.cancel()
                             break 
                         except Exception as e:
                             log_error(f"WS Message Error: {str(e)}")

@@ -28,243 +28,176 @@ if not API_KEY or not API_SECRET or API_KEY == "YOUR_API_KEY":
     exit(1)
 
 async def trading_loop(client):
-    """Dedicated loop for trading logic to ensure separation from UI."""
-    # Initial Sync
+    """Deeply optimized loop to prevent Rate Limits."""
+    # Initial setup
     await get_balance_async(client)
+    last_ticker_refresh = 0
+    loop_count = 0
     
     while True:
         try:
-            # 1. Update Core Data
-            await get_btc_trend(client)
+            now = time.time()
+            loop_count += 1
             
-            # 2. Use Tickers from WS (Updated in real-time)
-            # FALLBACK: If WS is offline or data is older than 5 seconds, poll REST
-            is_ws_stale = (time.time() - bot_state.get("ws_last_msg", 0)) > 5
-            
-            # Periodically fetch Funding and OI for top symbols
-            if bot_state["heartbeat"] % 10 == 0:
-                # We do this for current top symbols
-                asyncio.create_task(get_market_depth_data(client, market_data.current_scan_list))
-
-            if not market_data.tickers or is_ws_stale:
-                if is_ws_stale and bot_state.get("ws_msg_count", 0) > 0:
-                    bot_state["last_log"] = "[yellow]WS Lagging: Falling back to REST...[/]"
-                
+            # 1. Slow Cycle: BTC Trend and Full Ticker Refresh (Every 5 mins)
+            is_ws_stale = (now - bot_state.get("ws_last_msg", 0)) > 30
+            if loop_count % 300 == 0 or not market_data.tickers or is_ws_stale:
+                await get_btc_trend(client)
                 ticker_res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
                 if ticker_res.status_code == 200:
+                    last_ticker_refresh = now
                     tkr_data = ticker_res.json()
                     tkr = []
                     for t in tkr_data:
                         symbol = t["symbol"]
                         if not symbol.endswith("USDT"): continue
-                        price = float(t["lastPrice"])
                         tkr.append({
-                            "s": symbol, 
-                            "q": float(t["quoteVolume"]), 
-                            "c": price, 
-                            "o": float(t["openPrice"])
+                            "s": symbol, "q": float(t["quoteVolume"]), 
+                            "c": float(t["lastPrice"]), "o": float(t["openPrice"])
                         })
-                        # CRITICAL: Sync prices for UI
-                        market_data.prices[symbol] = price
-                        
+                        market_data.prices[symbol] = float(t["lastPrice"])
                     market_data.tickers = tkr
-            
-            if not market_data.tickers:
-                await asyncio.sleep(1)
-                continue
 
-            # Sort by volume and calculate change from open (approx 24h change)
+            if not market_data.tickers:
+                bot_state["last_log"] = "[yellow]Initial Sync...[/]"
+                await asyncio.sleep(2); continue
+
+            # 2. Process Prices (Fast, mostly from memory/WS)
             for t in market_data.tickers:
-                if t.get("o") and float(t["o"]) > 0:
-                    t["cp"] = ((float(t["c"]) - float(t["o"])) / float(t["o"])) * 100
+                if t["s"] in market_data.prices: t["c"] = market_data.prices[t["s"]]
+                if t.get("o") and t["o"] > 0: t["cp"] = ((t["c"] - t["o"]) / t["o"]) * 100
                 else: t["cp"] = 0
 
-            filtered = [t for t in market_data.tickers if float(t.get("q", 0)) > 20_000_000]
-            top_movers = sorted(filtered, key=lambda x: abs(float(x.get("cp", 0))), reverse=True)[:10]
+            # 3. Top Movers Selection
+            filtered = [t for t in market_data.tickers if t["q"] > 5_000_000]
+            top_movers = sorted(filtered, key=lambda x: abs(x["cp"]), reverse=True)[:10]
             top_symbols = [t["s"] for t in top_movers]
             
-            # Sync WS Subscriptions with current top symbols
+            # TURBO UI Placeholder
+            placeholder_results = []
+            for t in top_movers:
+                sym_full = t["s"]
+                k = market_data.klines.get(sym_full, {})
+                status = "SYNC (1m)" if "1m" not in k else "READY"
+                placeholder_results.append({
+                    "sym": t["s"].replace("USDT", ""), "price": f"{t['c']:,.4f}",
+                    "sig": status, "score": 0, "dir": 1 if t["cp"] > 0 else -1,
+                    "struct": "WAIT", "regime": "SCANNING"
+                })
+            if not bot_state.get("last_scan_results"): bot_state["last_scan_results"] = placeholder_results
+
             await ws_manager.update_subscriptions(top_symbols)
             
-            # 3. Analyze Symbols in Parallel
-            # We fetch active positions once here and store in bot_state for UI and logic
-            active_pos = await manage_active_positions(client, []) # Empty signals for now to get initial list
-            bot_state["active_positions"] = active_pos
-            active_pos_symbols = [p['symbol'] for p in active_pos]
-            limit_symbols = list(bot_state.get("limit_orders", {}).keys())
-            
-            # Update Intelligence Metrics
-            calculate_market_volatility()
-            net_bias = sum([1 if float(p['positionAmt']) > 0 else -1 for p in active_pos])
-            bot_state["directional_bias"] = net_bias
-
-            final_symbols = list(set(top_symbols + active_pos_symbols + limit_symbols))
-            market_data.current_scan_list = final_symbols
-            
-            # Use asyncio.gather for parallel analysis
-            tasks = [analyze_hybrid_async(client, s) for s in final_symbols]
-            all_results = await asyncio.gather(*tasks)
-            
-            all_valid = [r for r in all_results if r]
-            
-            # 4. Manage & Execute
-            # Re-run manage with actual signals for reversal logic
+            # 4. Critical Management (Once per loop)
+            # Use real analysis results from previous cycle for management
+            all_valid = bot_state.get("last_scan_results", [])
             active_pos = await manage_active_positions(client, all_valid)
             await manage_limit_orders(client, all_valid)
             bot_state["active_positions"] = active_pos
             
-            # --- MULTI-ORDER EXECUTION LOGIC ---
-            limit_orders = bot_state.get("limit_orders", {})
-            current_slots_occupied = len(active_pos) + len(limit_orders)
+            # Intelligence Metrics
+            calculate_market_volatility()
+            net_bias = sum([1 if float(p['positionAmt']) > 0 else -1 for p in active_pos])
+            bot_state["directional_bias"] = net_bias
+
+            # 5. Analysis Phase (Serial and Careful)
+            final_symbols = list(set(top_symbols + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
+            market_data.current_scan_list = final_symbols
             
-            if current_slots_occupied < MAX_POSITIONS and not bot_state.get("is_passive", False):
-                for s in all_valid:
-                    if "WAIT" in s["sig"] or s["ai"] is None: continue
+            analysis_results = []
+            for s in final_symbols:
+                res = await analyze_hybrid_async(client, s)
+                if res: analysis_results.append(res)
+            
+            if analysis_results:
+                # Merge and Sort
+                existing_syms = [r["sym"] for r in analysis_results]
+                for p in placeholder_results:
+                    if p["sym"] not in existing_syms: analysis_results.append(p)
+                bot_state["last_scan_results"] = sorted(analysis_results, key=lambda x: x.get('score', 0), reverse=True)
+            
+            # 6. Execution Phase
+            if not bot_state.get("is_passive", False):
+                for s in analysis_results:
+                    if "WAIT" in s["sig"] or s.get("ai") is None: continue
                     sym_full = s["sym"] + "USDT"
-                    
-                    # 1. STRICT SINGLE POSITION POLICY
-                    # Skip if symbol is already an active position
                     if any(p['symbol'] == sym_full for p in active_pos): continue
                     
-                    # 2. Check if we have room for NEW symbols
-                    is_update = sym_full in limit_orders
-                    if is_update:
-                        existing = limit_orders[sym_full]
-                        # Throttle Updates: Only update if signal changed or limit price moved > 0.1%
-                        price_diff = abs(s["ai"]["limit_price"] - float(existing["price"])) / float(existing["price"]) * 100
-                        if s["sig"] == existing.get("sig") and price_diff < 0.1:
-                            continue
-                    elif current_slots_occupied >= MAX_POSITIONS:
-                        # Skip new symbols if all slots are filled
-                        continue
-                    
                     sig_side = "LONG" if s["dir"] == 1 else "SHORT"
+                    if is_correlated_exposure(sym_full, sig_side): continue
                     
-                    # --- ULTRA-SMART FILTERS ---
-                    # 1. Correlation Check: Don't add more exposure to same-direction correlated coins
-                    if is_correlated_exposure(sym_full, sig_side):
-                        if not is_update: # Only skip if it's a new trade attempt
-                            bot_state["last_log"] = f"[yellow]SKIP {s['sym']}: High Correlation[/]"
-                            continue
-                        
-                    # 2. Directional Bias Check: Limit bias in choppy markets
-                    if bot_state["market_vol"] > 1.5 or "RANGING" in s.get("regime", ""):
-                        if abs(net_bias) >= 2 and ( (net_bias > 0 and sig_side == "LONG") or (net_bias < 0 and sig_side == "SHORT") ):
-                            if not is_update:
-                                bot_state["last_log"] = f"[yellow]SKIP {s['sym']}: Bias Limit ({net_bias})[/]"
-                                continue
-
                     can_open = False
-                    if not USE_BTC_FILTER or bot_state["btc_dir"] == 0:
-                        can_open = True
-                    elif sig_side == "LONG" and bot_state["btc_dir"] == 1:
-                        can_open = True
-                    elif sig_side == "SHORT" and bot_state["btc_dir"] == -1:
-                        can_open = True
+                    if not USE_BTC_FILTER or bot_state["btc_dir"] == 0: can_open = True
+                    elif sig_side == "LONG" and bot_state["btc_dir"] == 1: can_open = True
+                    elif sig_side == "SHORT" and bot_state["btc_dir"] == -1: can_open = True
                     
                     if can_open:
-                        await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
-                        if not is_update:
-                            current_slots_occupied += 1
+                        is_replacement = sym_full in bot_state.get("limit_orders", {})
+                        current_slots = len(active_pos) + len(bot_state.get("limit_orders", {}))
+                        
+                        if current_slots < MAX_POSITIONS or is_replacement:
+                            if is_replacement:
+                                old_lo = bot_state["limit_orders"][sym_full]
+                                try:
+                                    await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": sym_full, "orderId": old_lo["orderId"]})
+                                    # Also delete associated SL/TP algo orders
+                                    await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym_full})
+                                    del bot_state["limit_orders"][sym_full]
+                                except: pass
+                            
+                            await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
 
-                # Update balance once after potentially opening multiple positions
-                await get_balance_async(client)
-
-            # Store results for UI
-            bot_state["last_scan_results"] = all_valid
             bot_state["heartbeat"] += 1
-            save_state_to_db() # Persist state every cycle
-            
-            # If WS is lagging, we want to loop faster to simulate real-time via REST
-            loop_sleep = 0.5 if is_ws_stale else 1.0
-            await asyncio.sleep(loop_sleep)
+            await asyncio.to_thread(save_state_to_db)
+            await asyncio.sleep(1.5) # Relaxed loop
         except Exception as e:
-            err_msg = str(e)[:50]
-            bot_state["last_log"] = f"[red]Trading Loop Err: {err_msg}[/]"
-            log_error(f"Trading Loop Exception: {err_msg}")
-            await asyncio.sleep(2)
+            bot_state["last_log"] = f"[red]Loop Err: {str(e)[:40]}[/]"
+            await asyncio.sleep(5)
 
 async def cleanup_and_exit(client):
     """Clean up all pending orders before exiting."""
-    bot_state["last_log"] = "[bold red]EXITING: Cleaning up all limit orders...[/]"
+    bot_state["last_log"] = "[bold red]EXITING: Cleaning up...[/]"
     limit_orders = list(bot_state.get("limit_orders", {}).keys())
-    if limit_orders:
-        for sym in limit_orders:
-            try:
-                await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
-            except: pass
+    for sym in limit_orders:
+        try: await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
+        except: pass
     os._exit(0)
 
 async def main():
-    init_logger() # Reset log file
+    init_logger()
     console.clear()
     async with httpx.AsyncClient(timeout=30.0) as client:
-        # Start background tasks
-        asyncio.create_task(ws_manager.start())
+        asyncio.create_task(ws_manager.start(client))
         asyncio.create_task(trading_loop(client))
         
         with Live(None, refresh_per_second=2, screen=False) as live:
-            # Task for keyboard shortcuts
             async def handle_keys():
                 while True:
                     try:
                         key = await asyncio.get_event_loop().run_in_executor(None, sys.stdin.readline)
-                        key_clean = key.strip().lower()
-                        if key_clean == 'c':
-                            bot_state["last_log"] = "[bold red]EMERGENCY: Closing All Positions...[/]"
+                        k = key.strip().lower()
+                        if k == 'c':
                             res = await binance_request(client, 'GET', '/fapi/v2/positionRisk')
                             if res and res.status_code == 200:
-                                positions = [p for p in res.json() if float(p['positionAmt']) != 0]
-                                for p in positions:
-                                    symbol, amt = p['symbol'], float(p['positionAmt'])
-                                    side = "LONG" if amt > 0 else "SHORT"
-                                    await close_position_async(client, symbol, side, amt, "MANUAL-POS-ONLY")
-                        elif key_clean == 'k':
-                            bot_state["last_log"] = "[bold yellow]EMERGENCY: Canceling All Limit Orders...[/]"
-                            limit_orders = list(bot_state.get("limit_orders", {}).keys())
-                            for sym in limit_orders:
+                                for p in [x for x in res.json() if float(x['positionAmt']) != 0]:
+                                    await close_position_async(client, p['symbol'], "LONG" if float(p['positionAmt'])>0 else "SHORT", float(p['positionAmt']), "MANUAL")
+                        elif k == 'k':
+                            for sym in list(bot_state.get("limit_orders", {}).keys()):
                                 await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
                             bot_state["limit_orders"] = {}
-                        elif key_clean == 'a':
-                            bot_state["last_log"] = "[bold red]EMERGENCY: CLEARING EVERYTHING...[/]"
-                            # 1. Cancel Orders
-                            limit_orders = list(bot_state.get("limit_orders", {}).keys())
-                            for sym in limit_orders:
-                                await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
-                            bot_state["limit_orders"] = {}
-                            # 2. Close Positions
-                            res = await binance_request(client, 'GET', '/fapi/v2/positionRisk')
-                            if res and res.status_code == 200:
-                                positions = [p for p in res.json() if float(p['positionAmt']) != 0]
-                                for p in positions:
-                                    symbol, amt = p['symbol'], float(p['positionAmt'])
-                                    side = "LONG" if amt > 0 else "SHORT"
-                                    await close_position_async(client, symbol, side, amt, "MANUAL-ALL")
-                        elif key_clean == 'p':
+                        elif k == 'p':
                             bot_state["is_passive"] = not bot_state.get("is_passive", False)
-                            status = "ENABLED" if bot_state["is_passive"] else "DISABLED"
-                            bot_state["last_log"] = f"[bold yellow]PASSIVE MODE: {status}[/]"
-                        elif key_clean == 'x':
-                            await cleanup_and_exit(client)
-                    except Exception as e:
-                        log_error(f"Keyboard Task Err: {str(e)}")
-                        await asyncio.sleep(1)
+                        elif k == 'x': await cleanup_and_exit(client)
+                    except: await asyncio.sleep(1)
             
             asyncio.create_task(handle_keys())
-
             while True:
                 try:
                     dashboard = await generate_dashboard_async(client)
                     live.update(dashboard)
-                    await asyncio.sleep(0.5) # Smoother UI updates
-                except Exception as e:
-                    log_error(f"UI Update Err: {str(e)}")
-                    await asyncio.sleep(1) # Smoother UI updates
+                    await asyncio.sleep(0.5)
+                except: await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except KeyboardInterrupt:
-        # For KeyboardInterrupt, we'd need a way to run async cleanup.
-        # Given the sync nature of os._exit, we'll suggest users use 'x' for safe exit.
-        print("\nForce Exiting...")
-        os._exit(0)
+    except KeyboardInterrupt: os._exit(0)

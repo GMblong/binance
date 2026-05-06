@@ -66,12 +66,20 @@ class MarketData:
             
             if new_candle['ot'] == last_ot:
                 # Optimized update: directly set values on the existing row
-                # This is much faster than dict iteration or loc
                 for col in ["o", "h", "l", "c", "v", "tbv"]:
-                    df.iat[-1, df.columns.get_loc(col)] = new_candle[col]
+                    try:
+                        df.iat[-1, df.columns.get_loc(col)] = float(new_candle[col])
+                    except ValueError:
+                        # If dtype conflict (e.g. int64 vs float), force cast the whole column
+                        df[col] = df[col].astype(float)
+                        df.iat[-1, df.columns.get_loc(col)] = float(new_candle[col])
             elif new_candle['ot'] > last_ot:
                 # New candle rollover: minimal concat
                 new_row = pd.DataFrame([new_candle])
+                # Ensure new row has correct types before concat
+                for col in ["o", "h", "l", "c", "v", "tbv"]:
+                    new_row[col] = new_row[col].astype(float)
+                
                 df = pd.concat([df, new_row], ignore_index=True)
                 if len(df) > 300:
                     df = df.iloc[-300:]

@@ -25,35 +25,75 @@ async def binance_request(client, method, endpoint, params=None):
             else:
                 res = await client.get(url, params=full_params, headers=headers, timeout=10)
             
-            if res.status_code >= 500:
+            if res.status_code == 200:
+                return res
+            elif res.status_code == 429:
+                bot_state["last_log"] = "[bold red]RATE LIMIT (429)[/]"
+                await asyncio.sleep(min(30, 5 * (attempt + 1)))
+            elif res.status_code == 418:
+                bot_state["last_log"] = "[bold white on red] HARD BAN (418) - STOPPING 5 MIN [/]"
+                await asyncio.sleep(300)
+                return None
+            elif res.status_code >= 500:
                 raise httpx.HTTPStatusError(f"Server Error {res.status_code}", request=None, response=res)
-            return res
+            else:
+                if res.status_code == 400:
+                    log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
+                else:
+                    log_error(f"API Error {res.status_code} for {endpoint}", include_traceback=False)
+                return res
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt == 2: 
                 log_error(f"API Request Final Fail ({endpoint}): {str(e)}")
                 return None 
-            await asyncio.sleep(1 * (attempt + 1))
+            await asyncio.sleep(2 * (attempt + 1))
     return None
 
 async def get_symbol_precision(client, symbol):
     if symbol in symbol_info_cache: return symbol_info_cache[symbol]
     try:
         res = await client.get(f"{API_URL}/fapi/v1/exchangeInfo")
-        data = res.json()
-        for s in data['symbols']:
-            if s['symbol'] == symbol:
-                tick_size = float(next(f['tickSize'] for f in s['filters'] if f['filterType'] == 'PRICE_FILTER'))
-                step_size = float(next(f['stepSize'] for f in s['filters'] if f['filterType'] == 'LOT_SIZE'))
-                prec = {
-                    "tick": tick_size,
-                    "step": step_size,
-                    "p_prec": int(s['pricePrecision']),
-                    "q_prec": int(s['quantityPrecision'])
-                }
-                symbol_info_cache[symbol] = prec
-                return prec
-    except: pass
-    return {"tick": 0.01, "step": 0.01, "p_prec": 2, "q_prec": 2}
+        if res.status_code == 200:
+            data = res.json()
+            for s in data['symbols']:
+                if s['symbol'] == symbol:
+                    tick_size = float(next(f['tickSize'] for f in s['filters'] if f['filterType'] == 'PRICE_FILTER'))
+                    step_size = float(next(f['stepSize'] for f in s['filters'] if f['filterType'] == 'LOT_SIZE'))
+                    
+                    # Calculate precision based on tick/step size if p_prec/q_prec not accurate
+                    p_prec = int(s.get('pricePrecision', 2))
+                    q_prec = int(s.get('quantityPrecision', 2))
+                    
+                    prec = {
+                        "tick": tick_size,
+                        "step": step_size,
+                        "p_prec": p_prec,
+                        "q_prec": q_prec
+                    }
+                    symbol_info_cache[symbol] = prec
+                    return prec
+    except Exception as e:
+        log_error(f"Precision Fetch Error for {symbol}: {str(e)}")
+    
+    # Smarter fallback: BTC/ETH usually have more precision than others
+    if "BTC" in symbol or "ETH" in symbol:
+        return {"tick": 0.01, "step": 0.001, "p_prec": 2, "q_prec": 3}
+    return {"tick": 0.0001, "step": 0.1, "p_prec": 4, "q_prec": 1}
+
+async def get_listen_key(client):
+    try:
+        res = await client.post(f"{API_URL}/fapi/v1/listenKey", headers={'X-MBX-APIKEY': API_KEY})
+        if res.status_code == 200:
+            return res.json()['listenKey']
+    except Exception as e:
+        log_error(f"ListenKey Fetch Error: {str(e)}")
+    return None
+
+async def keep_alive_listen_key(client, listen_key):
+    try:
+        await client.put(f"{API_URL}/fapi/v1/listenKey", headers={'X-MBX-APIKEY': API_KEY})
+    except Exception as e:
+        log_error(f"ListenKey KeepAlive Error: {str(e)}")
 
 async def get_balance_async(client):
     try:

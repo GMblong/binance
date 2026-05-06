@@ -143,7 +143,8 @@ async def generate_dashboard_async(client):
                 if best_pick.get('sync'): reasons.append("[bold green]PERFECT TF SYNC[/]")
                 
                 reason_str = " + ".join(reasons) if reasons else "STRONG MOMENTUM"
-                insight_text = f"Top Pick: [bold white]{best_pick['sym']}[/] ({best_pick['score']}%). {reason_str}. Regime: [bold]{best_pick['regime']}[/]."
+                regime_str = best_pick.get("regime", "SCANNING")
+                insight_text = f"Top Pick: [bold white]{best_pick['sym']}[/] ({best_pick['score']}%). {reason_str}. Regime: [bold]{regime_str}[/]."
 
         # --- PORTFOLIO & PENDING ORDERS ---
         pos_table = Table(title=" 💼 ACTIVE POSITIONS ", expand=True, box=box.ROUNDED, header_style="bold magenta", border_style="magenta", title_style="bold yellow", title_justify="left")

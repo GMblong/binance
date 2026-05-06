@@ -4,3 +4,5 @@ pandas
 pandas-ta
 rich
 numpy
+scikit-learn
+xgboost

@@ -6,3 +6,4 @@ error.log
 __pycache__/
 *.pyc
 backup_v1/
+venv/
