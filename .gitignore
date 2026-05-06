@@ -1,0 +1,8 @@
+.env
+bot_data.db
+bot_output.log
+bot_state.json
+error.log
+__pycache__/
+*.pyc
+backup_v1/
