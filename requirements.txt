@@ -1,0 +1,6 @@
+httpx
+websockets
+pandas
+pandas-ta
+rich
+numpy
