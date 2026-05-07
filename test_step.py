@@ -34,11 +34,16 @@ async def test_step_by_step(symbol="BTCUSDT"):
             struct, fvg = MarketAnalyzer.detect_structure(d1m)
             print(f"   Structure (1m): {struct}, FVG: {fvg}")
             
-            print("3. Testing Scoring...")
-            # Mock current weights
-            weights = {"liq": 1.0, "ml": 1.0, "ob": 1.0, "div": 1.0}
-            score = MarketAnalyzer.calculate_score(d1m, d15m, 1, neural_weights=weights)
-            print(f"   Score (Bullish): {score}")
+            ema9_15 = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
+            ema21_15 = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
+            dir_15 = 1 if ema9_15 > ema21_15 else -1
+            print(f"   15m Trend: {'BULLISH' if dir_15 == 1 else 'BEARISH'} (EMA9: {ema9_15:.2f}, EMA21: {ema21_15:.2f})")
+            
+            # Testing Scoring with Neural Weights
+            print("3. Testing Scoring with Neural Weights...")
+            weights = {"RANGING:liq": 2.0, "RANGING:ob": 0.5, "RANGING:div": 1.5, "RANGING:ml": 1.0}
+            score = MarketAnalyzer.calculate_score(d1m, d15m, dir_15, regime=regime, neural_weights=weights)
+            print(f"   Score (with trend & weights): {score}")
             
             print("✅ All steps completed!")
         except Exception as e:

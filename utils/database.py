@@ -45,6 +45,16 @@ def init_db():
             expiry REAL
         )
     """)
+
+    # Table for per-symbol neural weights
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sym_weights (
+            symbol TEXT,
+            feature TEXT,
+            weight REAL,
+            PRIMARY KEY (symbol, feature)
+        )
+    """)
     
     conn.commit()
     conn.close()
@@ -78,6 +88,14 @@ def save_state_to_db():
                 INSERT OR REPLACE INTO strat_perf (feature, wins, losses, weight)
                 VALUES (?, ?, ?, ?)
             """, (feat, counts[0], counts[1], weight))
+
+        # Save Per-Symbol Weights
+        for sym, weights in bot_state["sym_weights"].items():
+            for feat, weight in weights.items():
+                cursor.execute("""
+                    INSERT OR REPLACE INTO sym_weights (symbol, feature, weight)
+                    VALUES (?, ?, ?)
+                """, (sym, feat, weight))
             
         # Save Blacklist
         for sym, expiry in bot_state["blacklist"].items():
@@ -110,6 +128,13 @@ def load_state_from_db():
         for row in rows:
             bot_state["strat_perf"][row[0]] = [row[1], row[2]]
             bot_state["neural_weights"][row[0]] = row[3]
+
+        # Load Per-Symbol Weights
+        cursor.execute("SELECT * FROM sym_weights")
+        for row in cursor.fetchall():
+            sym, feat, weight = row
+            if sym not in bot_state["sym_weights"]: bot_state["sym_weights"][sym] = {}
+            bot_state["sym_weights"][sym][feat] = weight
             
         # Initialize defaults for new regimes if not present
         for regime in ["TRENDING", "RANGING", "VOLATILE", "EXHAUSTION", "SQUEEZE"]:

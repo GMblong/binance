@@ -6,6 +6,8 @@ from utils.config import API_URL, API_KEY
 from utils.state import bot_state, market_data
 from strategies.analyzer import MarketAnalyzer
 from engine.ml_engine import ml_predictor
+from engine.api import get_orderbook_imbalance
+from utils.intelligence import get_current_session, detect_lead_lag, calculate_market_volatility
 from utils.logger import log_error
 
 api_sem = asyncio.Semaphore(10) # Increased to allow true concurrency
@@ -24,159 +26,198 @@ async def get_btc_trend(client):
     except: pass
 
 async def analyze_hybrid_async(client, symbol):
-    if symbol in busy_symbols: return None
+    if symbol in busy_symbols: 
+        with open("sync_debug.log", "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Skipping - in busy_symbols\n")
+        return None
     try:
         now = time.time()
+        with open("sync_debug.log", "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Starting analysis cycle\n")
         if symbol not in market_data.klines: market_data.klines[symbol] = {}
         
         last_p = market_data.last_prime.get(symbol, 0)
-        if (now - last_p) > 60: 
+        # Force sync if data is missing
+        if "1m" not in market_data.klines.get(symbol, {}) or (now - last_p) > 60: 
+            with open("sync_debug.log", "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Attempting sync. last_p: {last_p}, now: {now}\n")
             busy_symbols.add(symbol)
             try:
                 async with api_sem:
-                    headers = {'X-MBX-APIKEY': API_KEY, 'User-Agent': 'Mozilla/5.0'}
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    if API_KEY: headers['X-MBX-APIKEY'] = API_KEY
                     
-                    # Fetch 1m, 15m, and 1h data all at once (concurrently)
-                    t1 = client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15)
-                    t15 = client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15)
-                    t1h = client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15)
+                    res1 = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15)
+                    res15 = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15)
+                    res1h = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15)
                     
-                    results = await asyncio.gather(t1, t15, t1h, return_exceptions=True)
+                    with open("sync_debug.log", "a") as f:
+                        f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Statuses: {res1.status_code}, {res15.status_code}, {res1h.status_code}\n")
                     
-                    if not any(isinstance(r, Exception) for r in results):
-                        res1, res15, res1h = results
-                        if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
-                            def proc(data):
-                                df = pd.DataFrame(data).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
-                                df.columns = ["ot", "o", "h", "l", "c", "v", "tbv"]
-                                for col in ["o", "h", "l", "c", "v", "tbv"]: df[col] = df[col].astype(float)
-                                return df
-                            market_data.klines[symbol]["1m"] = proc(res1.json())
-                            market_data.klines[symbol]["15m"] = proc(res15.json())
-                            market_data.klines[symbol]["1h"] = proc(res1h.json())
-                            market_data.last_prime[symbol] = now
+                    if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
+                        data1, data15, data1h = res1.json(), res15.json(), res1h.json()
+                        with open("sync_debug.log", "a") as f:
+                            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Received JSON lengths: {len(data1)}, {len(data15)}, {len(data1h)}\n")
+
+                        def proc(data):
+                            df = pd.DataFrame(data).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
+                            df.columns = ["ot", "o", "h", "l", "c", "v", "tbv"]
+                            for col in ["o", "h", "l", "c", "v", "tbv"]: df[col] = df[col].astype(float)
+                            return df
+                        market_data.klines[symbol]["1m"] = proc(data1)
+                        market_data.klines[symbol]["15m"] = proc(data15)
+                        market_data.klines[symbol]["1h"] = proc(data1h)
+                        market_data.last_prime[symbol] = now
+
                     else:
-                        print(f"[{symbol}] Network error fetching klines: {results}")
+                        # SET LAST_PRIME TO AVOID SPAMMING ON FAILURE (Backoff 30 seconds)
+                        market_data.last_prime[symbol] = now - 30 
+                        with open("sync_debug.log", "a") as f:
+                            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: API Fail - Statuses: {res1.status_code}, {res15.status_code}, {res1h.status_code}\n")
             finally:
                 busy_symbols.discard(symbol)
 
         k = market_data.klines.get(symbol, {})
-        if "1m" not in k or "15m" not in k or "1h" not in k: return None
-        
+        # Re-check cache *after* sync attempt
+        if "1m" not in k or "15m" not in k or "1h" not in k: 
+            with open("sync_debug.log", "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Still missing data. Found keys: {list(k.keys())}\n")
+            return None
+
         d1m, d15m, d1h = k["1m"], k["15m"], k["1h"]
-        price = d1m["c"].iloc[-1]
         
-        # --- SMART INDICATORS ---
-        ema9_15m = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
-        ema21_15m = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
-        ema9_1m = MarketAnalyzer.get_ema(d1m["c"], 9).iloc[-1]
-        atr = MarketAnalyzer.get_atr(d1m, 14).iloc[-1]
+        with open("sync_debug.log", "a") as f:
+            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Proceeding to indicator calculation\n")
+
+        try:
+            price = d1m["c"].iloc[-1]
+            
+            # --- SMART INDICATORS ---
+            ema9_15m = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
+            ema21_15m = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
+            ema9_1m = MarketAnalyzer.get_ema(d1m["c"], 9).iloc[-1]
+            atr = MarketAnalyzer.get_atr(d1m, 14).iloc[-1]
+            
+            direction = 1 if ema9_15m > ema21_15m else -1
+            
+            with open("sync_debug.log", "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Indicators: Ema9_15: {ema9_15m}, Ema21_15: {ema21_15m}, Dir: {direction}\n")
+            
+            # ... [rest of the logic]
+        except Exception as e:
+            with open("sync_debug.log", "a") as f:
+                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Calculation Error: {str(e)}\n")
+            return None
         
         # --- HIGHER TIMEFRAME (HTF) BIAS ---
-        ema20_1h = MarketAnalyzer.get_ema(d1h["c"], 20).iloc[-1]
-        htf_direction = 1 if d1h["c"].iloc[-1] > ema20_1h else -1
-        
-        # Primary trend is determined by 15m (Macro Bias)
-        direction = 1 if ema9_15m > ema21_15m else -1
-        
-        # Multi-Timeframe Alignment: Ensure 15m trend aligns with 1h trend
-        mtf_aligned = (direction == htf_direction)
+        htf_direction = direction
+        mtf_aligned = True
         
         # --- INSTITUTIONAL DATA GATHERING ---
-        from engine.api import get_orderbook_imbalance
         imbalance = await get_orderbook_imbalance(client, symbol)
-        funding = market_data.funding.get(symbol, 0)
-        oi = market_data.oi.get(symbol, 0)
-        
-        score = MarketAnalyzer.calculate_score(d1m, d15m, direction, imbalance, funding)
+        funding = market_data.funding.get(symbol, 0.0)
         regime = MarketAnalyzer.detect_regime(d15m)
+        session = get_current_session()
+        lead_lag = detect_lead_lag(symbol)
+        
+        # --- PER-SYMBOL DYNAMIC WEIGHTS ---
+        # Try to get specific weights for this symbol, fallback to global weights
+        s_weights = bot_state.get("sym_weights", {}).get(symbol)
+        if not s_weights:
+            s_weights = bot_state.get("neural_weights")
+            
+        score = MarketAnalyzer.calculate_score(d1m, d15m, direction, imbalance, funding, regime, s_weights, session, lead_lag)
         struct, _ = MarketAnalyzer.detect_structure(d1m)
         
-        # If HTF is not aligned, we penalize the score significantly
-        if not mtf_aligned:
-            score -= 40 # Heavy penalty for fighting the 1h trend
-            
         # --- MACHINE LEARNING INTEGRATION ---
-        # Inject current OI and Funding into the dataframe for feature engineering
-        d15m_with_institutional = d15m.copy()
-        d15m_with_institutional['oi'] = oi
-        d15m_with_institutional['funding'] = funding
-        
         # Predict UP probability (0.0 to 1.0)
-        ml_prob = await ml_predictor.predict(client, symbol, d15m_with_institutional)
+        ml_prob = await ml_predictor.predict(client, symbol, d1m)
         ml_score_boost = 0
-        if direction == 1 and ml_prob > 0.6:
-            ml_score_boost = int((ml_prob - 0.5) * 40) # Up to +20 score
-        elif direction == -1 and ml_prob < 0.4:
-            ml_score_boost = int((0.5 - ml_prob) * 40) # Up to +20 score
-            
-        # Severe penalty if ML strongly disagrees with TA direction
-        if (direction == 1 and ml_prob < 0.4) or (direction == -1 and ml_prob > 0.6):
-            ml_score_boost = -30
-        
-        score = min(max(score + ml_score_boost, 0), 100) # Ensure score is between 0 and 100
-        
-        # --- SMART ENTRY (SMC / Pullback Logic) ---
-        fvg = MarketAnalyzer.get_nearest_fvg(d1m)
-        ob = MarketAnalyzer.find_nearest_order_block(d1m, price, direction)
-        
+        ml_w = s_weights.get(f"{regime}:ml", 1.0) if s_weights else 1.0
+
+        # Logika Baru (Scaled Confidence): 
+        # Hanya boost jika sangat yakin (>65% atau <35%), dan penalti berskala jika tidak setuju
         if direction == 1:
-            if ob and ob["type"] == "BULLISH":
-                limit_p = ob["top"] * 1.0005 # Front-run offset
-            elif fvg and fvg["type"] == "BULLISH":
-                limit_p = fvg["top"] * 1.0005
-            else:
-                limit_p = price * 0.9995 # Default 0.05% discount
-                if price > ema9_1m: limit_p = (price + ema9_1m) / 2 # Midpoint entry
+            if ml_prob >= 0.65:
+                ml_score_boost = int((ml_prob - 0.6) * 50 * ml_w)
+            elif ml_prob < 0.40:
+                ml_score_boost = int((ml_prob - 0.4) * 50 * ml_w) # Hasil negatif
+        elif direction == -1:
+            if ml_prob <= 0.35:
+                ml_score_boost = int((0.4 - ml_prob) * 50 * ml_w)
+            elif ml_prob > 0.60:
+                ml_score_boost = int((0.6 - ml_prob) * 50 * ml_w) # Hasil negatif
+        
+        score = min(max(score + ml_score_boost, 0), 100)
+        
+        # --- ENTRY LOGIC (Full Sniper - Limit Only) ---
+        # Default target: EMA9 (Pullback Level)
+        limit_p = ema9_1m
+        
+        # Try to find FVG for a more precise institutional entry
+        fvg = MarketAnalyzer.get_nearest_fvg(d1m)
+        if direction == 1:
+            if fvg and fvg["type"] == "BULLISH":
+                # Front-run the FVG top slightly for better fill
+                limit_p = fvg["top"]
         else:
-            if ob and ob["type"] == "BEARISH":
-                limit_p = ob["bottom"] * 0.9995 # Front-run offset
-            elif fvg and fvg["type"] == "BEARISH":
-                limit_p = fvg["bottom"] * 0.9995
-            else:
-                limit_p = price * 1.0005 # Default 0.05% premium
-                if price < ema9_1m: limit_p = (price + ema9_1m) / 2 # Midpoint entry
+            if fvg and fvg["type"] == "BEARISH":
+                limit_p = fvg["bottom"]
 
         # --- SMART VOLATILITY RISK (ATR Based) ---
-        # SL = 2x ATR (minimum 0.7%, maximum 3%)
-        sl_pct = max(0.7, min(3.0, (atr * 2 / price * 100)))
+        # SL = 2.97x ATR (minimum 0.7%, maximum 3%)
+        sl_pct = max(0.7, min(3.0, (atr * 2.97 / price * 100)))
         
-        # Adaptive RR: If ML is very sure (>0.85), go for bigger target
-        rr_mult = 2.5 if ml_prob > 0.85 or ml_prob < 0.15 else 1.5
+        # Adaptive RR: Use optimized 2.08x
+        rr_mult = 2.08
         tp_pct = sl_pct * rr_mult
         
-        # Breakout detection for Aggressive Entry
+        # Breakout detection
         prev_5_high = d1m['h'].iloc[-6:-1].max()
         prev_5_low = d1m['l'].iloc[-6:-1].min()
         is_breakout = (direction == 1 and price > prev_5_high) or (direction == -1 and price < prev_5_low)
         
+        # Logika Baru: Adaptive Threshold berdasarkan Regime & Breakout
+        threshold = 75
+        if regime == "VOLATILE":
+            threshold = 70 if is_breakout else 85 
+        elif regime == "RANGING":
+            threshold = 85  
+        elif regime == "TRENDING":
+            threshold = 75 if is_breakout else 80
+            
+        # --- ADAPTIVE EXECUTION ENGINE ---
+        # 1. Decide Entry Mode based on Regime and Score
+        is_market_order = False
+        
+        if regime == "TRENDING":
+            # In Trending markets, we are more aggressive to avoid missing the move
+            if score >= 95 or is_breakout:
+                is_market_order = True
+                limit_p = price # Market Execution
+        elif regime == "VOLATILE":
+            # In Volatile markets, we ONLY use market orders if it's a confirmed breakout with extreme score
+            if score >= 97 and is_breakout:
+                is_market_order = True
+                limit_p = price
+        # In RANGING mode, we stay 100% Sniper (Limit Only)
+
         signal = "WAIT"
         dist = abs(price - limit_p) / price * 100
         
-        if score >= 75:
-            # ULTRA-SNIPER LOGIC:
-            # 1. Mode Agresif (High Conviction + Breakout): Market Order (SCALP-LONG/SHORT)
-            # 2. Mode Sabar (Score 75-84): Limit Order (Wait for dist <= 0.3)
-            if (score >= 85 and is_breakout) or dist <= 0.1:
+        if score >= threshold:
+            # Sniper logic: Only signal if we are reasonably close to our target or if it's a market order
+            if is_market_order or dist <= 0.6:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-                limit_p = price # Market entry
-            elif dist <= 0.3:
-                signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-                # Keep the limit_p as calculated for Limit Order
         
-        # If signal is still WAIT but score is high, it means we are waiting for pullback (Limit Order)
-        # But hybrid_trader.py needs a signal to open an order.
-        # Actually, the trader opens a LIMIT order if the signal is SCALP-*.
-        # So we should return the signal if score >= 75 and dist <= 0.3.
-
         return {
-            "sym": symbol.replace("USDT", ""), "price": f"{price:,.4f}", "limit": limit_p,
-            "sig": signal, "score": score, "struct": struct[:4], "dir": direction, "dir_15m": direction,
+            "sym": symbol.replace("USDT", ""), "price": f"{price:,.4f}", "limit": float(limit_p),
+            "sig": signal, "score": int(score), "struct": struct[:4], "dir": int(direction), "dir_15m": int(direction),
             "regime": regime, "ai": {
-                "tp": tp_pct, "sl": sl_pct, "limit_price": limit_p,
-                "ts_act": sl_pct * 0.8, "ts_cb": sl_pct * 0.3, # Dynamic Trailing
-                "type": "SCALP", "regime": regime, "score": score, "ml_prob": round(ml_prob, 2),
-                "is_market": (score >= 85 and is_breakout)
+                "tp": float(tp_pct), "sl": float(sl_pct), "limit_price": float(limit_p),
+                "ts_act": float(sl_pct * 0.8), "ts_cb": float(sl_pct * 0.3), 
+                "type": "SCALP", "regime": regime, "score": int(score), "ml_prob": float(round(ml_prob, 2)),
+                "is_market": is_market_order
             }
         }
     except Exception as e:

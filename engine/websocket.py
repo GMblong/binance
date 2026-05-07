@@ -137,15 +137,33 @@ class WebSocketManager:
                                         o = data["o"]
                                         sym = o['s']
                                         oid = o['i']
+                                        status = o['X']
                                         
+                                        # Update active_positions cache on Fill/Partial
+                                        if status in ["FILLED", "PARTIALLY_FILLED"]:
+                                            # We trigger a background refresh to be 100% sure of the state
+                                            from engine.api import binance_request
+                                            async def refresh_pos():
+                                                res = await binance_request(client, 'GET', '/fapi/v2/positionRisk')
+                                                if res and res.status_code == 200:
+                                                    bot_state["active_positions"] = [p for p in res.json() if float(p['positionAmt']) != 0]
+                                            asyncio.create_task(refresh_pos())
+
                                         # 1. Update Daily PnL on every trade execution
                                         if o.get("x") == "TRADE":
                                             trade_rp = float(o.get("rp", 0))
                                             if trade_rp != 0:
                                                 bot_state["daily_pnl"] = bot_state.get("daily_pnl", 0.0) + trade_rp
                                         
-                                        # 2. Handle W/L and Logging on FILLED or significant TRADE
-                                        if o["X"] == "FILLED":
+                                        # 2. IMMEDIATELY CLEAN UP LIMIT ORDERS ON FILL/CANCEL
+                                        if status in ["FILLED", "PARTIALLY_FILLED", "CANCELED", "EXPIRED"]:
+                                            if sym in bot_state.get("limit_orders", {}):
+                                                # If it's the same order ID, remove it
+                                                if bot_state["limit_orders"][sym].get("orderId") == oid:
+                                                    del bot_state["limit_orders"][sym]
+                                        
+                                        # 3. Handle W/L and Logging on FILLED or significant TRADE
+                                        if status == "FILLED":
                                             bot_state["last_log"] = f"[bold green]WS: {sym} Filled at {o['L']}[/]"
                                             
                                             # Avoid double counting W/L for the same order
@@ -172,7 +190,17 @@ class WebSocketManager:
 
                                 # 2. Market Data
                                 elif "@ticker" in stream_name:
-                                    market_data.prices[data['s']] = float(data['c'])
+                                    symbol = data['s']
+                                    price = float(data['c'])
+                                    market_data.prices[symbol] = price
+                                    
+                                    # FAST EXIT CHECK: If we have an active position, check exits immediately
+                                    active_symbols = [p['symbol'] for p in bot_state.get("active_positions", [])]
+                                    if symbol in active_symbols:
+                                        # Trigger fast exit check using current analysis context
+                                        from engine.trading import check_and_execute_exits
+                                        all_valid = bot_state.get("last_scan_results", [])
+                                        asyncio.create_task(check_and_execute_exits(client, symbol, price, all_valid))
                                 elif "@kline_" in stream_name:
                                     k = data['k']
                                     await market_data.update_kline(data['s'], k['i'], {

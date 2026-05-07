@@ -5,6 +5,9 @@ from utils.state import bot_state, market_data
 from utils.helpers import round_step
 from engine.api import binance_request, get_symbol_precision
 from utils.logger import log_error
+from utils.intelligence import calculate_kelly_risk
+from engine.ml_engine import ml_predictor
+from strategies.analyzer import MarketAnalyzer
 
 async def open_position_async(client, symbol, side, signal_type, ai_brain):
     try:
@@ -19,17 +22,28 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         balance = bot_state["balance"]
         base_risk = balance * ACCOUNT_RISK_PERCENT
         
-        # --- DYNAMIC POSITION SIZING ---
+        # --- DYNAMIC POSITION SIZING (KELLY + ML) ---
         ml_prob = ai_brain.get("ml_prob", 0.5)
+        
+        # Get historical win rate from ML performance
+        perf = ml_predictor.performance.get(symbol, [])
+        win_rate = sum(perf) / len(perf) if len(perf) >= 5 else 0.5
+        
+        kelly_mult = calculate_kelly_risk(symbol, win_rate=win_rate, rr=2.0)
+        
         if ml_prob > 0.75 or ml_prob < 0.25:
-            risk_amt = base_risk * 1.2 # 120% of normal risk for high conviction
+            risk_amt = base_risk * 1.2 * kelly_mult
         elif ml_prob >= 0.6 or ml_prob <= 0.4:
-            risk_amt = base_risk # 100% of normal risk
+            risk_amt = base_risk * kelly_mult
         else:
-            risk_amt = base_risk * 0.5 # 50% of normal risk for low conviction
+            risk_amt = base_risk * 0.5 * kelly_mult
 
         sl_pct = max(0.1, ai_brain.get("sl", 1.0)) # Safety: Min 0.1% SL
         
+        # Prevent division by zero if limit_price is too small and rounded to 0
+        if limit_price <= 0:
+            return False
+            
         # Quantity = Risk Amount / (Price * SL%)
         quantity = risk_amt / (limit_price * (sl_pct / 100))
         quantity = round_step(quantity, prec["step"])
@@ -41,10 +55,37 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         max_notional = balance * MAX_LEVERAGE
         if notional > max_notional:
             quantity = round_step(max_notional / limit_price * 0.9, prec["step"])
+            notional = quantity * limit_price
         
         if quantity <= 0: return False
 
         limit_price_str = f"{limit_price:.{prec['p_prec']}f}"
+
+        # --- SET LEVERAGE EXPLICITLY DYNAMICALLY ---
+        # Attempt to set leverage starting from MAX_LEVERAGE down to 1.
+        for target_lev in [MAX_LEVERAGE, 25, 20, 15, 10, 5, 2, 1]:
+            try:
+                lev_res = await binance_request(client, 'POST', '/fapi/v1/leverage', {"symbol": symbol, "leverage": target_lev})
+                if lev_res and lev_res.status_code == 200:
+                    max_notional_tier = float(lev_res.json().get("maxNotionalValue", max_notional))
+                    # Safely cap quantity if it still exceeds the tier's max notional
+                    if notional > max_notional_tier:
+                        quantity = round_step(max_notional_tier / limit_price * 0.9, prec["step"])
+                        notional = quantity * limit_price
+                    break # Success, exit loop
+                elif lev_res and lev_res.status_code == 400:
+                    # If Binance says this specific leverage is invalid, try the next one in the loop
+                    continue
+            except: pass
+            
+        if quantity <= 0: return False
+        
+        # Also attempt to set margin type to ISOLATED to avoid cross margin issues
+        try:
+            await binance_request(client, 'POST', '/fapi/v1/marginType', {"symbol": symbol, "marginType": "ISOLATED"})
+        except: pass
+
+        if quantity <= 0: return False
 
         # --- ORDER EXECUTION (MARKET vs LIMIT) ---
         is_market = ai_brain.get("is_market", False)
@@ -103,14 +144,29 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
             except Exception as e:
                 log_error(f"SL/TP Placement Exception for {symbol}: {str(e)}")
             
-            bot_state["limit_orders"][symbol] = {
-                "orderId": order_data["orderId"],
-                "side": side,
-                "price": limit_price,
-                "quantity": quantity,
-                "ai": ai_brain,
-                "timestamp": time.time()
-            }
+            if not is_market:
+                bot_state["limit_orders"][symbol] = {
+                    "orderId": order_data["orderId"],
+                    "side": side,
+                    "price": limit_price,
+                    "quantity": quantity,
+                    "ai": ai_brain,
+                    "timestamp": time.time()
+                }
+            else:
+                # For Market orders, we sync to trades immediately so it doesn't show as "pending" in UI
+                bot_state["trades"][symbol] = {
+                    "peak": execution_price, 
+                    "tp": ai_brain.get("tp", 2.0), 
+                    "sl": ai_brain.get("sl", 1.0), 
+                    "ts_act": ai_brain.get("ts_act", 0.8), 
+                    "ts_cb": ai_brain.get("ts_cb", 0.25), 
+                    "side": "LONG" if side == "BUY" else "SHORT", 
+                    "entry_time": time.time(),
+                    "type": ai_brain.get("type", "INTRA"), 
+                    "regime": ai_brain.get("regime", "TRENDING"), 
+                    "atr_pct": ai_brain.get("atr_pct", 0.5)
+                }
             return True
         else:
             msg = res.json().get("msg", "Unknown") if res else "No Response"
@@ -140,6 +196,9 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
             col = "green" if pnl > 0 else "red"
             bot_state["last_log"] = f"[bold {col}]CLOSED {symbol} ({reason}) | Est. PnL: {pnl:+.2f}%[/]"
             
+            # Update ML Predictor Performance
+            ml_predictor.update_performance(symbol, pnl > 0)
+            
             # W/L and Exact Daily PNL is now tracked via WebSocket's Realized Profit (rp) event
             if symbol in bot_state["trades"]: del bot_state["trades"][symbol]
             return True
@@ -159,6 +218,72 @@ async def manage_limit_orders(client, all_signals):
                 bot_state["last_log"] = f"[dim]Cancelled stale limit for {symbol}[/]"
     except Exception as e:
         log_error(f"Manage Limit Orders Exception: {str(e)}")
+
+async def check_and_execute_exits(client, symbol, current_price, all_signals=[]):
+    """
+    Fast Execution Engine: Checks SL/TP/Trailing/Reversal for a single symbol.
+    Triggered by WebSocket or Main Loop.
+    """
+    try:
+        # Get position details from local state for speed
+        pos = next((p for p in bot_state.get("active_positions", []) if p['symbol'] == symbol), None)
+        if not pos: return False
+        
+        entry_price = float(pos['entryPrice'])
+        side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
+        amt = float(pos['positionAmt'])
+        pnl_pct = ((current_price - entry_price) / entry_price) * 100 * (1 if side == "LONG" else -1)
+        
+        ai = bot_state["trades"].get(symbol, {})
+        if not ai: return False
+        
+        # Update Peak for Trailing Stop
+        if side == "LONG": ai["peak"] = max(ai.get("peak", current_price), current_price)
+        else: ai["peak"] = min(ai.get("peak", current_price), current_price)
+        peak_pnl = abs((ai["peak"] - entry_price) / entry_price * 100)
+
+        reason = None
+        
+        # 1. Trailing Stop Logic (Fast Check)
+        trail_act = ai.get("ts_act", 0.8)
+        base_cb = ai.get("ts_cb", 0.25)
+        market_vol = bot_state.get("market_vol", 1.0)
+        vol_multiplier = min(max(market_vol, 0.5), 2.0)
+        dynamic_cb = base_cb * vol_multiplier
+        
+        current_cb = dynamic_cb
+        if peak_pnl >= trail_act * 3: current_cb = dynamic_cb * 0.3
+        elif peak_pnl >= trail_act * 2: current_cb = dynamic_cb * 0.6
+        elif peak_pnl >= trail_act * 1.5: current_cb = dynamic_cb * 0.8
+            
+        if peak_pnl >= trail_act and (peak_pnl - pnl_pct) >= current_cb:
+            reason = f"AI-TRAIL {pnl_pct:.2f}% (CB: {current_cb:.2f}%)"
+
+        # 2. Smart Reversal & Momentum Check
+        if EXIT_ON_REVERSAL and not reason and all_signals:
+            sym_short = symbol.replace("USDT", "")
+            curr_sig = next((s for s in all_signals if s["sym"] == sym_short), None)
+            if curr_sig and "ai" in curr_sig:
+                sig_dir = curr_sig["dir"]
+                curr_score = curr_sig.get("score", 0)
+                ml_prob = curr_sig["ai"].get("ml_prob", 0.5)
+                
+                if side == "LONG" and sig_dir == -1 and ml_prob < 0.4:
+                    reason = "AI-REVERSAL (BEARISH)"
+                elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.6:
+                    reason = "AI-REVERSAL (BULLISH)"
+                elif pnl_pct > 0.3:
+                    if side == "LONG" and curr_score < 30 and ml_prob < 0.5:
+                        reason = "SMART-TP (MOMENTUM DEAD)"
+                    elif side == "SHORT" and curr_score < 30 and ml_prob > 0.5:
+                        reason = "SMART-TP (MOMENTUM DEAD)"
+
+        if reason:
+            return await close_position_async(client, symbol, side, amt, reason, pnl_pct)
+        return False
+    except Exception as e:
+        log_error(f"Fast Exit Exception ({symbol}): {str(e)}")
+        return False
 
 async def manage_active_positions(client, all_signals):
     try:
@@ -191,12 +316,15 @@ async def manage_active_positions(client, all_signals):
                         "type": ai.get("type", "INTRA"), "regime": ai.get("regime", "TRENDING"), 
                         "atr_pct": ai.get("atr_pct", 0.5)
                     }
-                    if symbol in bot_state["limit_orders"]: del bot_state["limit_orders"][symbol]
                 else:
                     bot_state["trades"][symbol] = {
                         "peak": mark_price, "tp": 2.0, "sl": 1.0, "ts_act": 0.8, "ts_cb": 0.25, 
                         "side": side, "entry_time": time.time(), "type": "INTRA"
                     }
+            
+            # CRITICAL: Always remove from limit_orders if we found an active position for this symbol
+            if symbol in bot_state["limit_orders"]:
+                del bot_state["limit_orders"][symbol]
             
             ai = bot_state["trades"].get(symbol, {})
             if side == "LONG": ai["peak"] = max(ai.get("peak", mark_price), mark_price)
@@ -210,77 +338,49 @@ async def manage_active_positions(client, all_signals):
             has_sl = any(o['type'] in ['STOP_MARKET', 'STOP'] for o in symbol_orders)
             has_tp = any(o['type'] in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_orders)
 
-            if not has_sl or not has_tp:
+            # --- STRUCTURAL SL PROTECTION ---
+            # Periodically check for new Order Blocks to move SL behind them
+            k1m = market_data.klines.get(symbol, {}).get("1m")
+            struct_sl = None
+            if k1m is not None:
+                if side == "LONG":
+                    ob = MarketAnalyzer.find_nearest_order_block(k1m, mark_price, 1)
+                    if ob and ob["bottom"] > entry_price:
+                        struct_sl = ob["bottom"]
+                else:
+                    ob = MarketAnalyzer.find_nearest_order_block(k1m, mark_price, -1)
+                    if ob and ob["top"] < entry_price:
+                        struct_sl = ob["top"]
+
+            if not has_sl or not has_tp or struct_sl:
                 prec = await get_symbol_precision(client, symbol)
-                if not has_sl:
-                    sl_mult = (1 - (ai.get("sl", 1.0)/100)) if side == "LONG" else (1 + (ai.get("sl", 1.0)/100))
-                    sl_price = round_step(entry_price * sl_mult, prec["tick"])
+                if not has_sl or struct_sl:
+                    if struct_sl:
+                        # Move SL to structure but keep it safe (buffer)
+                        sl_price = round_step(struct_sl, prec["tick"])
+                    else:
+                        sl_mult = (1 - (ai.get("sl", 1.0)/100)) if side == "LONG" else (1 + (ai.get("sl", 1.0)/100))
+                        sl_price = round_step(entry_price * sl_mult, prec["tick"])
+                    
+                    # Update or Create SL
+                    if has_sl: # Cancel existing SL first if we are moving it
+                        sl_order = next(o for o in symbol_orders if o['type'] in ['STOP_MARKET', 'STOP'])
+                        await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": sl_order["orderId"]})
+                    
                     await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
                         "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
                         "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": f"{sl_price:.{prec['p_prec']}f}",
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
-                if not has_tp:
-                    tp_mult = (1 + (ai.get("tp", 2.0)/100)) if side == "LONG" else (1 - (ai.get("tp", 2.0)/100))
-                    tp_price = round_step(entry_price * tp_mult, prec["tick"])
-                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
-                        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
-                        "type": "TAKE_PROFIT_MARKET", "algoType": "CONDITIONAL", "triggerPrice": f"{tp_price:.{prec['p_prec']}f}",
-                        "closePosition": "true", "workingType": "MARK_PRICE"
-                    })
 
-            # 3. EXIT LOGIC
-            reason = None
-            if bot_state["btc_state"] == "DANGER" and GLOBAL_BTC_EXIT: reason = "BTC-DANGER"
+            # 3. EXIT LOGIC (Now handled by Fast Exit Engine)
+            all_valid = all_signals # Pass context
+            exit_triggered = await check_and_execute_exits(client, symbol, mark_price, all_valid)
             
-            trail_act = ai.get("ts_act", 0.8)
-            base_cb = ai.get("ts_cb", 0.25)
-            
-            # --- VOLATILITY-ADJUSTED DYNAMIC TRAILING STOP ---
-            # Adjust callback based on global market volatility to avoid being stopped out by noise
-            market_vol = bot_state.get("market_vol", 1.0)
-            vol_multiplier = min(max(market_vol, 0.5), 2.0) # Cap multiplier between 0.5x and 2x
-            
-            # Base callback is expanded in high volatility, tightened in low volatility
-            dynamic_cb = base_cb * vol_multiplier
-            
-            # As profit grows larger, tighten the callback to lock in profit (Tiered + Volatility aware)
-            current_cb = dynamic_cb
-            if peak_pnl >= trail_act * 3:
-                current_cb = dynamic_cb * 0.3  # Super tight (30%) if 3x target
-            elif peak_pnl >= trail_act * 2:
-                current_cb = dynamic_cb * 0.6  # Medium tight (60%) if 2x target
-            elif peak_pnl >= trail_act * 1.5:
-                current_cb = dynamic_cb * 0.8  # Slightly tight if 1.5x target
-                
-            if peak_pnl >= trail_act and (peak_pnl - pnl_pct) >= current_cb:
-                reason = f"AI-TRAIL {pnl_pct:.2f}% (CB: {current_cb:.2f}%)"
-                
-            # Smart Exit / Reversal Detection
-            if EXIT_ON_REVERSAL and not reason:
-                sym_short = symbol.replace("USDT", "")
-                curr_sig = next((s for s in all_signals if s["sym"] == sym_short), None)
-                if curr_sig and "ai" in curr_sig:
-                    sig_dir = curr_sig["dir"]
-                    curr_score = curr_sig.get("score", 0)
-                    ml_prob = curr_sig["ai"].get("ml_prob", 0.5)
-                    
-                    # 1. Reversal Detection (Cutting Losses Early)
-                    if side == "LONG" and sig_dir == -1 and ml_prob < 0.4:
-                        reason = "AI-REVERSAL (BEARISH)"
-                    elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.6:
-                        reason = "AI-REVERSAL (BULLISH)"
-                    
-                    # 2. Smart Take Profit (Momentum Exhaustion)
-                    # If we are in profit, but the trend has completely lost momentum (score dropped below 30)
-                    elif pnl_pct > 0.3: # Only trigger if we have at least 0.3% profit
-                        if side == "LONG" and curr_score < 30 and ml_prob < 0.5:
-                            reason = "SMART-TP (MOMENTUM DEAD)"
-                        elif side == "SHORT" and curr_score < 30 and ml_prob > 0.5:
-                            reason = "SMART-TP (MOMENTUM DEAD)"
-            
-            if reason:
-                await close_position_async(client, symbol, side, amt, reason, pnl_pct)
+            if not exit_triggered:
+                # Still check for BTC-DANGER which is a global factor
+                if bot_state["btc_state"] == "DANGER" and GLOBAL_BTC_EXIT:
+                    await close_position_async(client, symbol, side, amt, "BTC-DANGER", pnl_pct)
 
         return positions
     except Exception as e:

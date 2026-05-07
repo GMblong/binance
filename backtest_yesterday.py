@@ -10,8 +10,24 @@ from rich.table import Table
 from strategies.analyzer import MarketAnalyzer
 from engine.ml_engine import ml_predictor
 from utils.config import API_URL
+from datetime import time as dt_time
 
 console = Console()
+
+def get_session_from_ts(ts):
+    now = datetime.utcfromtimestamp(ts / 1000).time()
+    if dt_time(13, 0) <= now <= dt_time(22, 0): return "NEW_YORK"
+    if dt_time(8, 0) <= now <= dt_time(17, 0): return "LONDON"
+    if dt_time(0, 0) <= now <= dt_time(9, 0): return "ASIA"
+    return "QUIET"
+
+def detect_lead_lag_sim(sub_sym, sub_lead):
+    if len(sub_sym) < 5 or len(sub_lead) < 5: return 0
+    sym_ret = (sub_sym['c'].iloc[-1] - sub_sym['c'].iloc[-5]) / sub_sym['c'].iloc[-5] * 100
+    lead_ret = (sub_lead['c'].iloc[-1] - sub_lead['c'].iloc[-5]) / sub_lead['c'].iloc[-5] * 100
+    if lead_ret > 0.3 and sym_ret < 0.1: return 1
+    if lead_ret < -0.3 and sym_ret > -0.1: return -1
+    return 0
 
 async def get_top_movers(client, limit=10):
     res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
@@ -43,6 +59,9 @@ async def run_single_iteration(client, symbols, reference_time, iteration):
     all_data = {}
     end_t = int((reference_time - 86400) * 1000)
     
+    # Pre-fetch BTC data for simulation context
+    btc_1m = await fetch_klines(client, "BTCUSDT", "1m", limit=1500, end_time=end_t)
+
     for symbol in symbols:
         # Train only once per session to save time
         if symbol not in ml_predictor.models:
@@ -140,7 +159,9 @@ async def run_single_iteration(client, symbols, reference_time, iteration):
                 if any(p['symbol'] == symbol for p in active_positions): continue
                 
                 actual_idx = len(data["1m"]) - sim_length + i
-                curr_price = data["1m"]["c"].iloc[actual_idx]
+                curr_row = data["1m"].iloc[actual_idx]
+                curr_price = curr_row['c']
+                curr_ts = curr_row['ot']
                 
                 d15_idx = int(actual_idx / 15)
                 if d15_idx >= len(data["15m"]): d15_idx = len(data["15m"]) - 1
@@ -159,7 +180,14 @@ async def run_single_iteration(client, symbols, reference_time, iteration):
                 ema21_15m = MarketAnalyzer.get_ema(sub_15m['c'], 21).iloc[-1]
                 direction = 1 if ema9_15m > ema21_15m else -1
                 
-                score = MarketAnalyzer.calculate_score(sub_1m, sub_15m, direction, 1.0, 0.0)
+                regime = MarketAnalyzer.detect_regime(sub_15m)
+                
+                # Simulation Context
+                session = get_session_from_ts(curr_ts)
+                sub_btc = btc_1m.iloc[:actual_idx+1]
+                lead_lag = detect_lead_lag_sim(sub_1m, sub_btc)
+                
+                score = MarketAnalyzer.calculate_score(sub_1m, sub_15m, direction, 1.0, 0.0, regime=regime, session=session, lead_lag=lead_lag)
                 if direction != htf_dir: score -= 40
                 
                 ml_prob = 0.5

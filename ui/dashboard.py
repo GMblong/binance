@@ -11,11 +11,13 @@ from rich import box
 
 from utils.config import USE_BTC_FILTER, MAX_POSITIONS, API_URL, DAILY_PROFIT_TARGET_PCT
 from utils.state import bot_state, market_data
-from utils.intelligence import get_current_session
+from utils.intelligence import get_current_session, calculate_kelly_risk
 from engine.api import get_balance_async, binance_request, get_market_depth_data
+from engine.ml_engine import ml_predictor
 from engine.websocket import ws_manager
 from engine.trading import manage_active_positions, open_position_async
 from strategies.hybrid import get_btc_trend, analyze_hybrid_async
+from strategies.analyzer import MarketAnalyzer
 
 ticker_cache = {} # {symbol: last_data}
 
@@ -53,8 +55,8 @@ async def generate_dashboard_async(client):
             table = Table(title=f" {title} ", expand=True, box=box.ROUNDED, border_style="cyan", header_style="bold cyan", title_style="bold cyan", title_justify="left")
             table.add_column("SYMBOL", justify="left", style="bold white")
             table.add_column("TREND", justify="center")
-            table.add_column("L2 FLOW", justify="center")
-            table.add_column("SPARK (15m)", justify="center")
+            table.add_column("ML PROB", justify="center")
+            table.add_column("POC DIST", justify="center")
             table.add_column("SCORE", justify="center")
             table.add_column("SMC STRUCT", justify="center")
             table.add_column("SIGNAL", justify="right")
@@ -72,6 +74,22 @@ async def generate_dashboard_async(client):
                 trend_icon = "🔼" if is_bull else ("🔽" if r.get("dir", 0) == -1 else "➖")
                 trend_col = "bold green" if is_bull else ("bold red" if r.get("dir", 0) == -1 else "dim white")
                 
+                # ML Probability
+                ml_prob = r.get("ai", {}).get("ml_prob", 0.5)
+                ml_col = "green" if ml_prob > 0.65 else ("red" if ml_prob < 0.35 else "white")
+                ml_str = f"[{ml_col}]{ml_prob:.2f}[/]"
+                
+                # POC Distance
+                poc_dist_str = "[dim]-[/]"
+                sym_full = r['sym'] + "USDT"
+                if sym_full in market_data.klines and "15m" in market_data.klines[sym_full]:
+                    vp = MarketAnalyzer.get_volume_profile(market_data.klines[sym_full]["15m"])
+                    if vp:
+                        curr_p = float(r['price'].replace(',', ''))
+                        dist = (curr_p - vp['poc']) / vp['poc'] * 100
+                        dist_col = "green" if dist > 0 else "red"
+                        poc_dist_str = f"[{dist_col}]{dist:+.2f}%[/]"
+
                 if score_val >= 80:
                     score_col = "bold bright_green" if is_bull else "bold bright_red"
                     bar_char = "█"
@@ -91,29 +109,17 @@ async def generate_dashboard_async(client):
                 score_bar = f"[{score_col}]{bar_char * bar_length}[/][dim {bg_col}]{bg_char * (10 - bar_length)}[/]"
                 
                 sig = r['sig']
-                sym_full = r['sym'] + "USDT"
                 curr_price_live = market_data.prices.get(sym_full, r.get('price', '0.00'))
                 
                 if "SCALP" in sig or "SQZ" in sig: sig_style = "bold blink yellow"
                 elif "INTRA" in sig: sig_style = "bold blink cyan"
                 else: sig_style = "dim white"
                 
-                # Sparkline logic
-                spark = ""
-                l2_ratio = market_data.imbalance.get(sym_full, 1.0)
-                l2_col = "green" if l2_ratio > 1.3 else ("red" if l2_ratio < 0.7 else "white")
-                l2_str = f"[{l2_col}]{l2_ratio:.1f}x[/]"
-
-                if sym_full in market_data.klines and "15m" in market_data.klines[sym_full]:
-                    hist_prices = market_data.klines[sym_full]["15m"]["c"].tail(10).tolist()
-                    spark_col = "green" if is_bull else "red"
-                    spark = f"[{spark_col}]{generate_sparkline(hist_prices)}[/]"
-
                 table.add_row(
                     r["sym"], 
                     f"[{trend_col}]{trend_icon}[/]",
-                    l2_str,
-                    spark,
+                    ml_str,
+                    poc_dist_str,
                     f"{score_bar} [bold]{score_val}%[/]", 
                     f"[cyan]{r.get('struct', 'CHOP')}[/]", 
                     f"[{sig_style}]{sig}[/]\n[dim]{curr_price_live}[/]"
@@ -142,13 +148,27 @@ async def generate_dashboard_async(client):
                 if best_pick.get('ob'): reasons.append("[bold magenta]ORDER BLOCK REACTION[/]")
                 if best_pick.get('sync'): reasons.append("[bold green]PERFECT TF SYNC[/]")
                 
+                # Volume Profile & VSA Insights
+                sym_full = best_pick['sym'] + "USDT"
+                if sym_full in market_data.klines and "15m" in market_data.klines[sym_full]:
+                    vp = MarketAnalyzer.get_volume_profile(market_data.klines[sym_full]["15m"])
+                    if vp:
+                        curr_p = float(best_pick['price'].replace(',', ''))
+                        if curr_p > vp['poc']: reasons.append("[bold green]ABOVE POC[/]")
+                        else: reasons.append("[bold red]BELOW POC[/]")
+                    
+                    vsa_sig = MarketAnalyzer.detect_vsa_signals(market_data.klines[sym_full]["1m"])
+                    if vsa_sig != 0:
+                        reasons.append(f"[bold yellow]VSA ({'BULL' if vsa_sig==1 else 'BEAR'})[/]")
+
                 reason_str = " + ".join(reasons) if reasons else "STRONG MOMENTUM"
                 regime_str = best_pick.get("regime", "SCANNING")
                 insight_text = f"Top Pick: [bold white]{best_pick['sym']}[/] ({best_pick['score']}%). {reason_str}. Regime: [bold]{regime_str}[/]."
 
         # --- PORTFOLIO & PENDING ORDERS ---
         pos_table = Table(title=" 💼 ACTIVE POSITIONS ", expand=True, box=box.ROUNDED, header_style="bold magenta", border_style="magenta", title_style="bold yellow", title_justify="left")
-        pos_table.add_column("SYMBOL"); pos_table.add_column("SIDE"); pos_table.add_column("ENTRY"); pos_table.add_column("MARK")
+        pos_table.add_column("SYMBOL"); pos_table.add_column("SIDE"); pos_table.add_column("KELLY", justify="center")
+        pos_table.add_column("ENTRY"); pos_table.add_column("MARK")
         pos_table.add_column("TP/SL (BOT)", justify="center"); pos_table.add_column("PNL", justify="right")
         
         for p in active_pos:
@@ -159,15 +179,23 @@ async def generate_dashboard_async(client):
             pnl_col = "bold white on green" if pnl > 0 else "bold white on red"
             
             tp_sl_str = "[dim]-[/]"
+            kelly_str = "[dim]1.0x[/]"
             if symbol in bot_state["trades"]:
                 ai_data = bot_state["trades"][symbol]
                 tp_val = ai_data.get("tp", 0)
                 sl_val = ai_data.get("sl", 0)
                 tp_sl_str = f"[green]{tp_val:.1f}%[/]/[red]{sl_val:.1f}%[/]"
+                
+                # Dynamic Kelly Multiplier
+                perf = ml_predictor.performance.get(symbol, [])
+                wr = sum(perf) / len(perf) if len(perf) >= 5 else 0.5
+                km = calculate_kelly_risk(symbol, win_rate=wr)
+                kelly_str = f"[bold cyan]{km:.1f}x[/]"
 
             pos_table.add_row(
                 f"[bold white]{symbol}[/]",
                 f"[{side_col}]{side}[/]",
+                kelly_str,
                 f"{float(p['entryPrice']):,.4f}",
                 f"{float(p['markPrice']):,.4f}",
                 tp_sl_str,
@@ -185,6 +213,10 @@ async def generate_dashboard_async(client):
         limit_table.add_column("SPEC (SL/TP)"); limit_table.add_column("SCORE")
 
         for symbol, lo in limit_orders.items():
+            # Safety: Skip if already showing in active positions
+            if any(p['symbol'] == symbol for p in active_pos):
+                continue
+
             ai = lo.get("ai", {})
             side_col = "green" if lo['side'] == "BUY" else "red"
             side_str = "LONG" if lo['side'] == "BUY" else "SHORT"
@@ -282,10 +314,11 @@ async def generate_dashboard_async(client):
         pnl_col = "bold bright_green" if display_pnl > 0 else ("bold bright_red" if display_pnl < 0 else "white")
 
         # Card 1: Main Status
+        opt_status = "[bold green]ONLINE[/]" if (time.time() % 60 < 5) else "[dim green]STANDBY[/]"
         status_card = Panel(
             Align.center(Text.from_markup(
                 f"[{hb_style}] {hb_char} [/][bold white on bright_magenta] SUPREME v9 [/]\n"
-                f"[dim white]SES: [/][{sess_col}]{session}[/] [dim]|[/] [dim white]FLOW: [/]{sector_status}"
+                f"[dim white]SES: [/][{sess_col}]{session}[/] [dim]|[/] [dim white]OPT: [/]{opt_status}"
             )), border_style="bright_magenta", box=box.ROUNDED
         )
         
@@ -322,7 +355,7 @@ async def generate_dashboard_async(client):
             Layout(Panel(
                 Text.from_markup(
                     f"{bot_state['last_log']}\n"
-                    f"[dim white] [P] Passive | [C] Close Pos | [K] Cancel Limit | [A] Clear All | [X] Exit | Ref: {datetime.now().strftime('%H:%M:%S')}[/]"
+                    f"[dim white] [P] Passive | [C] Close All | [TAB] Select | [K] Cancel Limit | [X] Exit | Ref: {datetime.now().strftime('%H:%M:%S')}[/]"
                 ), 
                 title=" SYSTEM LOGS & CONTROLS ", 
                 border_style="dim", box=box.ROUNDED

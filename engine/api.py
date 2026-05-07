@@ -147,7 +147,17 @@ async def get_market_depth_data(client, symbols):
                 market_data.oi[s] = float(res_oi.json()['openInterest'])
     except: pass
 
+last_imbalance_fetch = {}
+
 async def get_orderbook_imbalance(client, symbol):
+    import time
+    global last_imbalance_fetch
+    now = time.time()
+    
+    # Throttle requests to once every 10 seconds per symbol to prevent 429
+    if now - last_imbalance_fetch.get(symbol, 0) < 10:
+        return market_data.imbalance.get(symbol, 1.0)
+        
     try:
         res = await client.get(f"{API_URL}/fapi/v1/depth", params={"symbol": symbol, "limit": 20})
         if res.status_code == 200:
@@ -160,10 +170,12 @@ async def get_orderbook_imbalance(client, symbol):
             if asks == 0: asks = 1 # Prevent division by zero
             imbalance = bids / asks
             market_data.imbalance[symbol] = imbalance
+            last_imbalance_fetch[symbol] = now
             return imbalance
     except Exception as e:
         log_error(f"Orderbook Imbalance Error ({symbol}): {str(e)}")
-    return 1.0
+    
+    return market_data.imbalance.get(symbol, 1.0)
 
 async def get_btc_dominance(client):
     try:

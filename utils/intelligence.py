@@ -71,3 +71,37 @@ def is_correlated_exposure(new_symbol, new_side):
                 return True
                 
     return False
+
+def calculate_kelly_risk(symbol, win_rate=0.5, rr=2.0):
+    """Calculates a fractional Kelly multiplier based on historical performance."""
+    try:
+        # K = W - ((1 - W) / R)
+        kelly = win_rate - ((1 - win_rate) / rr)
+        # Use Half-Kelly for safety and cap it between 0.5x and 1.5x of base risk
+        multiplier = max(0.5, min(1.5, (kelly * 0.5) / 0.125)) # 0.125 is half-kelly for 50% WR/2RR
+        return round(multiplier, 2)
+    except:
+        return 1.0
+
+def detect_lead_lag(symbol, leader="BTCUSDT"):
+    """
+    Detects if the symbol is lagging behind a market leader.
+    Returns: 1 (Lagging Bullish), -1 (Lagging Bearish), 0 (Neutral)
+    """
+    try:
+        df_sym = market_data.klines.get(symbol, {}).get("1m")
+        df_lead = market_data.klines.get(leader, {}).get("1m")
+        
+        if df_sym is None or df_lead is None or len(df_sym) < 5 or len(df_lead) < 5:
+            return 0
+            
+        sym_ret = (df_sym['c'].iloc[-1] - df_sym['c'].iloc[-5]) / df_sym['c'].iloc[-5] * 100
+        lead_ret = (df_lead['c'].iloc[-1] - df_lead['c'].iloc[-5]) / df_lead['c'].iloc[-5] * 100
+        
+        # If leader moved > 0.3% and sym moved < 0.1% in same direction
+        if lead_ret > 0.3 and sym_ret < 0.1: return 1 # Bullish lag
+        if lead_ret < -0.3 and sym_ret > -0.1: return -1 # Bearish lag
+        
+        return 0
+    except:
+        return 0

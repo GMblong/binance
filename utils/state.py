@@ -1,5 +1,6 @@
 import asyncio
 import pandas as pd
+import time
 
 bot_state = {
     "balance": 0.0,
@@ -36,6 +37,8 @@ bot_state = {
     "is_passive": False, # If True, don't open new trades
     "market_vol": 1.0, # Market-wide volatility index
     "directional_bias": 0, # Net direction of current positions
+    "sym_weights": {}, # {symbol: {regime:feature: weight}}
+    "ui_active": False, # If True, keyboard listener is paused
 }
 
 symbol_info_cache = {}
@@ -84,5 +87,7 @@ class MarketData:
                 if len(df) > 300:
                     df = df.iloc[-300:]
                 self.klines[symbol][interval] = df.reset_index(drop=True)
+                
+            self.last_prime[symbol] = time.time()
 
 market_data = MarketData()
