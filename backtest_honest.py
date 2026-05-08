@@ -128,8 +128,24 @@ async def run(symbols, sim_window_hours=24, train_lookback_hours=24,
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         if not symbols:
-            symbols = await select_liquid_trending(client, API_URL, limit=5)
-            console.print(f"Liquid-trending picker selected: {symbols}")
+            try:
+                from backtest.universe import select_liquid_trending
+                symbols = await select_liquid_trending(
+                    client, API_URL, limit=5, debug=True
+                )
+            except Exception as exc:
+                console.print(f"[yellow]Picker error: {exc}[/]")
+                symbols = []
+            if not symbols:
+                # Last-resort fallback so the pipeline always has data.
+                symbols = [
+                    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+                ]
+                console.print(
+                    f"[yellow]Picker returned nothing, using fallback: {symbols}[/]"
+                )
+            else:
+                console.print(f"Liquid-trending picker selected: {symbols}")
         else:
             console.print(f"Using symbols: {symbols}")
 
