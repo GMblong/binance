@@ -120,7 +120,9 @@ class MLPredictorV2:
             return False
 
         feat_cols = [c for c in data.columns if c != "y"]
-        X = data[feat_cols].values
+        # Keep DataFrame (with column names) through fit so sklearn's validator
+        # does not warn about missing feature names at predict time.
+        X = data[feat_cols]
         yv = data["y"].values.astype(int)
 
         # Time-based split: no shuffle, train on the first 85%.
@@ -145,7 +147,9 @@ class MLPredictorV2:
         if feats.empty:
             return 0.5
         feat_cols = self.feature_names[symbol]
-        x = feats[feat_cols].iloc[[-1]].values
+        # Pass a DataFrame with the same column order used during fit to keep
+        # sklearn's feature-name validator happy.
+        x = feats[feat_cols].iloc[[-1]]
         try:
             return float(model.predict_proba(x)[0][1])
         except Exception:
