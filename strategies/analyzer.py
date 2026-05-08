@@ -23,6 +23,27 @@ class MarketAnalyzer:
         return tr.rolling(window=length).mean()
 
     @staticmethod
+    def get_adx(df, length=14):
+        """Calculate ADX (Average Directional Index). Returns scalar value."""
+        try:
+            if len(df) < length * 2: return 25  # Default neutral
+            high, low, close = df['h'], df['l'], df['c']
+            plus_dm = high.diff().clip(lower=0)
+            minus_dm = (-low.diff()).clip(lower=0)
+            # Zero out when other is larger
+            plus_dm[plus_dm < minus_dm] = 0
+            minus_dm[minus_dm < plus_dm] = 0
+            tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+            atr = tr.ewm(span=length, adjust=False).mean()
+            plus_di = 100 * (plus_dm.ewm(span=length, adjust=False).mean() / atr)
+            minus_di = 100 * (minus_dm.ewm(span=length, adjust=False).mean() / atr)
+            dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)) * 100
+            adx = dx.ewm(span=length, adjust=False).mean()
+            return float(adx.iloc[-1])
+        except:
+            return 25
+
+    @staticmethod
     def get_volume_profile(df, bins=20):
         try:
             if len(df) < 30: return None
@@ -110,12 +131,18 @@ class MarketAnalyzer:
             atr = MarketAnalyzer.get_atr(df, 14)
             atr_pct = (atr / close) * 100
             
-            curr_c = close.iloc[-1]
-            curr_ema = ema20.iloc[-1]
             curr_atr_p = atr_pct.iloc[-1]
+            # Percentile-based: adapt to each coin's own volatility history
+            atr_p75 = atr_pct.tail(100).quantile(0.75) if len(atr_pct) >= 100 else atr_pct.quantile(0.75)
+            atr_p25 = atr_pct.tail(100).quantile(0.25) if len(atr_pct) >= 100 else atr_pct.quantile(0.25)
             
-            if curr_atr_p > 1.5: return "VOLATILE"
-            if abs(curr_c - curr_ema) / curr_ema * 100 > 0.5: return "TRENDING"
+            if curr_atr_p > atr_p75: return "VOLATILE"
+            
+            # Z-score of price distance from EMA for trend detection
+            dist = ((close - ema20) / ema20 * 100).tail(30)
+            dist_std = dist.std()
+            curr_dist = dist.iloc[-1]
+            if dist_std > 0 and abs(curr_dist) > dist_std * 1.2: return "TRENDING"
             return "RANGING"
         except: return "RANGING"
 
@@ -316,7 +343,7 @@ class MarketAnalyzer:
                         ob_top, ob_bottom = df['h'].iloc[i], df['l'].iloc[i]
                         mitigated = False
                         for j in range(i+2, len(df)):
-                            if df['h'].iloc[j] > ob_bottom:
+                            if df['h'].iloc[j] > ob_top:
                                 mitigated = True
                                 break
                         if not mitigated:

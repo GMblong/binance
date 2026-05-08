@@ -3,15 +3,10 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import log_loss
-from sklearn.calibration import CalibratedClassifierCV
-import optuna
 from utils.config import API_URL
 import pandas_ta as ta
 import asyncio
 import time
-
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 class MLPredictor:
     def __init__(self):
@@ -20,7 +15,8 @@ class MLPredictor:
         self.performance = {} # Store win rate tracking (symbol: [list of bool])
         self.feature_importance = {} # Store feature importance per symbol
         self.feature_cache = {} # Cache for pre-calculated features {symbol: df}
-        self.retrain_sem = asyncio.Semaphore(2) # Limit to 2 concurrent retrains (M6)
+        self.retrain_sem = asyncio.Semaphore(5) # Allow 5 concurrent retrains for fast startup
+        self.startup_done = False
 
     def update_performance(self, symbol, is_win):
         if symbol not in self.performance: self.performance[symbol] = []
@@ -58,7 +54,6 @@ class MLPredictor:
         
         # Higher Time Frame Proxies (using 1m data)
         df['ema_60'] = ta.ema(df['c'], length=60)
-        df['ema_240'] = ta.ema(df['c'], length=240)
             
         # Institutional Flow Proxies (VWAP & CVD)
         df['typical_price'] = (df['h'] + df['l'] + df['c']) / 3
@@ -72,11 +67,11 @@ class MLPredictor:
         buy_vol = df['v'] * ((df['c'] - df['l']) / range_diff)
         sell_vol = df['v'] * ((df['h'] - df['c']) / range_diff)
         df['cvd'] = (buy_vol - sell_vol).cumsum()
-        df['cvd_roc'] = df['cvd'].pct_change(3)
+        df['cvd_roc'] = df['cvd'].pct_change(3).fillna(0)
         
         # 2. Institutional Flow (OI & Funding)
         if 'oi' not in df.columns: df['oi'] = 0
-        df['oi_roc'] = df['oi'].pct_change(3)
+        df['oi_roc'] = df['oi'].pct_change(3).fillna(0)
         if 'funding' not in df.columns: df['funding'] = 0
 
         # 3. Momentum & Volatility
@@ -98,7 +93,8 @@ class MLPredictor:
         if not is_training:
             return df.tail(1) # For prediction, we only need the last row
         
-        df.dropna(inplace=True)
+        features = self._get_feature_list(df.columns)
+        df.dropna(subset=features, inplace=True)
         return df
 
     def apply_triple_barrier(self, df, pt_mult=1.5, sl_mult=1.0, lookahead=12):
@@ -130,45 +126,50 @@ class MLPredictor:
         df.dropna(subset=['target'], inplace=True)
         return df
 
-    async def fetch_historical_data(self, client, symbol, interval="15m", limit=1500, end_time=None):
+    async def fetch_historical_data(self, client, symbol, interval="15m", limit=300, end_time=None):
         try:
             params = {"symbol": symbol, "interval": interval, "limit": limit}
             if end_time: params["endTime"] = end_time
-            res = await client.get(f"{API_URL}/fapi/v1/klines", params=params, timeout=10)
+            res = await client.get(f"{API_URL}/fapi/v1/klines", params=params, timeout=15)
             if res.status_code != 200: return None
             df = pd.DataFrame(res.json()).iloc[:, [0, 1, 2, 3, 4, 5]]
             df.columns = ["ot", "o", "h", "l", "c", "v"]
             for col in ["ot", "o", "h", "l", "c", "v"]: df[col] = df[col].astype(float)
-            if limit > 200:
-                res_oi = await client.get(f"{API_URL}/fapi/v1/openInterestHist", params={"symbol": symbol, "period": "15m", "limit": 500}, timeout=10)
-                if res_oi.status_code == 200:
-                    oi_df = pd.DataFrame(res_oi.json())
-                    if not oi_df.empty:
-                        oi_df['ot'], oi_df['oi'] = oi_df['timestamp'].astype(float), oi_df['sumOpenInterest'].astype(float)
-                        df = pd.merge(df, oi_df[['ot', 'oi']], on='ot', how='left').ffill()
             return df
         except: return None
 
     async def train_model(self, client, symbol, end_time=None):
-        df = await self.fetch_historical_data(client, symbol, interval="1m", limit=1500, end_time=end_time)
-        if df is None or len(df) < 500: return False
+        # 15m is more predictable (less noise), use as primary training interval
+        df = await self.fetch_historical_data(client, symbol, interval="15m", limit=500, end_time=end_time)
+        lookahead = 8  # ~2 hours forward
+        if df is None or len(df) < 200:
+            # Fallback to 1m with 1500 candles
+            df = await self.fetch_historical_data(client, symbol, interval="1m", limit=1500, end_time=end_time)
+            lookahead = 15
+            if df is None or len(df) < 500: return False
         def _train_sync():
             df_sync = self.feature_engineering(df.copy())
-            df_sync = self.apply_triple_barrier(df_sync, pt_mult=1.5, sl_mult=1.2, lookahead=15)
-            if len(df_sync) < 200: return False
+            df_sync = self.apply_triple_barrier(df_sync, pt_mult=1.5, sl_mult=1.2, lookahead=lookahead)
+            if len(df_sync) < 100: return False
             features = self._get_feature_list(df_sync.columns)
             X, y = df_sync[features], df_sync['target']
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, shuffle=False)
-            # Base LightGBM Model
-            base_model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=2, verbose=-1)
-            # Calibrate Probabilities (H2)
-            model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+            model = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.06, max_depth=5, num_leaves=20, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=-1, verbose=-1)
             model.fit(X_train, y_train)
-            
-            # TODO: Logging metrics (H3) if required, skipping for brevity as model fits inside loop
+            # Validate before deploy - reject bad models
+            test_acc = (model.predict(X_test) == y_test).mean()
+            if test_acc < 0.50: return False  # Model worse than random
             self.models[symbol], self.last_trained[symbol] = model, time.time()
             return True
         return await asyncio.to_thread(_train_sync)
+
+    async def batch_pretrain(self, client, symbols):
+        """Pre-train all models in parallel at startup for instant predictions."""
+        async def _train_one(sym):
+            async with self.retrain_sem:
+                await self.train_model(client, sym)
+        await asyncio.gather(*[_train_one(s) for s in symbols], return_exceptions=True)
+        self.startup_done = True
 
     async def predict(self, client, symbol, current_df):
         now = time.time()

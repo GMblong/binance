@@ -25,6 +25,7 @@ from ui.dashboard import generate_dashboard_async
 from strategies.hybrid import get_btc_trend, analyze_hybrid_async
 from utils.database import init_db, load_state_from_db, save_state_to_db
 from utils.intelligence import calculate_market_volatility, is_correlated_exposure
+from coin_screener import screen_coins
 from utils.logger import init_logger, log_error
 
 console = Console()
@@ -42,6 +43,23 @@ async def trading_loop(client):
     last_ticker_refresh = 0
     loop_count = 0
     
+    # --- EAGER ML PRE-TRAINING ---
+    # Fetch tickers first, then pre-train ML on top coins immediately
+    from engine.ml_engine import ml_predictor
+    await get_btc_trend(client)  # Immediate BTC trend detection
+    ticker_res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
+    if ticker_res.status_code == 200:
+        tkr_data = ticker_res.json()
+        tkr = [{"s": t["symbol"], "q": float(t["quoteVolume"]), "c": float(t["lastPrice"]), "o": float(t["openPrice"])} for t in tkr_data if t["symbol"].endswith("USDT")]
+        market_data.tickers = tkr
+        for t in tkr: market_data.prices[t["s"]] = t["c"]
+        last_ticker_refresh = time.time()
+        # Pre-train top 10 coins by volume
+        top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:10]
+        pretrain_symbols = [t["s"] for t in top_by_vol]
+        asyncio.create_task(ml_predictor.batch_pretrain(client, pretrain_symbols))
+        bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(pretrain_symbols)} models...[/]"
+    
     while True:
         try:
             now = time.time()
@@ -50,7 +68,7 @@ async def trading_loop(client):
             # --- KILL-SWITCH HARIAN (C1) ---
             if bot_state.get("start_balance", 0) > 0:
                 daily_pnl_pct = ((bot_state.get("balance", 0) - bot_state["start_balance"]) / bot_state["start_balance"]) * 100
-                if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT or daily_pnl_pct >= DAILY_PROFIT_TARGET_PCT:
+                if daily_pnl_pct <= -(DAILY_LOSS_LIMIT_PCT * 100) or daily_pnl_pct >= (DAILY_PROFIT_TARGET_PCT * 100):
                     if not bot_state.get("is_passive", False):
                         bot_state["is_passive"] = True
                         bot_state["last_log"] = f"[bold red]KILL-SWITCH ACTIVATED (PnL: {daily_pnl_pct:.2f}%)![/]"
@@ -70,7 +88,7 @@ async def trading_loop(client):
                 await get_balance_async(client)
 
             # Throttle the heavy ticker endpoint to at most once per 60 seconds
-            if loop_count % 300 == 0 or not market_data.tickers or (is_ws_stale and now - last_ticker_refresh > 60):
+            if loop_count % 40 == 0 or not market_data.tickers or (is_ws_stale and now - last_ticker_refresh > 60):
                 await get_btc_trend(client)
                 ticker_res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
                 if ticker_res.status_code == 200:
@@ -97,20 +115,19 @@ async def trading_loop(client):
                 if t.get("o") and t["o"] > 0: t["cp"] = ((t["c"] - t["o"]) / t["o"]) * 100
                 else: t["cp"] = 0
 
-            # 3. Top Movers Selection
+            # 3. Smart Coin Selection (Multi-Factor Screener)
             filtered = [t for t in market_data.tickers if t["q"] > 5_000_000]
-            top_movers = sorted(filtered, key=lambda x: abs(x["cp"]), reverse=True)[:15] # Ambil 15 teratas
-            top_symbols = [t["s"] for t in top_movers]
+            top_symbols = screen_coins(filtered, top_n=15)
             
             # TURBO UI Placeholder
             placeholder_results = []
-            for t in top_movers[:10]: # Display top 10 in UI
-                sym_full = t["s"]
-                k = market_data.klines.get(sym_full, {})
+            for sym in top_symbols[:10]:
+                k = market_data.klines.get(sym, {})
                 status = "SYNC (1m)" if "1m" not in k else "READY"
+                price_val = market_data.prices.get(sym, 0)
                 placeholder_results.append({
-                    "sym": t["s"].replace("USDT", ""), "price": f"{t['c']:,.4f}",
-                    "sig": status, "score": 0, "dir": 1 if t["cp"] > 0 else -1,
+                    "sym": sym.replace("USDT", ""), "price": f"{price_val:,.4f}",
+                    "sig": status, "score": 0, "dir": 0,
                     "struct": "WAIT", "regime": "SCANNING"
                 })
             if not bot_state.get("last_scan_results"): bot_state["last_scan_results"] = placeholder_results
