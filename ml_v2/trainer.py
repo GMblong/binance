@@ -304,4 +304,12 @@ def train_pooled(
         "sym_id_map": sym_id_map,
         "metrics": metrics,
         "regime_thresholds": thresholds,
+        # Expose the final pooled corpus (X, y) so callers can warm-
+        # start the OnlineLearner from the same labels the frozen
+        # LightGBM just trained on. Without this, every sweep wasted
+        # its first ~30 trades in pure warmup.
+        "warm_corpus": {
+            "X": X_all,
+            "y": y_all,
+        },
     }

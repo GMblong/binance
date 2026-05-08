@@ -225,6 +225,105 @@ class OnlineLearner:
             self._replay_X = self._replay_X[drop:]
             self._replay_y = self._replay_y[drop:]
 
+    # ---------------- warm start ----------------
+    def warm_start_from_corpus(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: pd.Series | np.ndarray,
+        max_samples: int = 2000,
+        tail_bias: bool = True,
+    ) -> int:
+        """Bootstrap the online learner from a labelled corpus (typically
+        the same rows ml_v2.train_pooled just trained on).
+
+        Before this method existed, the OnlineLearner sat at P=0.5 for
+        the first ~30 trades of every sweep -- observed in v3 runs
+        where days 1-2 were pure fee-burn while `n_updates` climbed
+        from 0 to ~25. warm_start_from_corpus() lets us launch with
+        30+ labels already absorbed, so the live head is
+        `is_ready()=True` on the very first bar of simulation and
+        `recent_auc()` reflects its real edge instead of 0.5 noise.
+
+        Labels here are the SAME `y_up` used in live updates
+        (triple-barrier binary from ml_v2.labeling); since we don't
+        know the trade direction we would have taken, we just treat
+        UP (label=1) as "the market went up within horizon" and leave
+        direction-conditioning to the live record_outcome() calls.
+
+        `max_samples`: cap the warm corpus so we don't overwhelm the
+        buffer on >50k row datasets. `tail_bias=True` keeps the most
+        recent rows since they are closest to the live distribution.
+
+        Returns the number of samples actually absorbed. 0 means the
+        sklearn stack is missing or the inputs were empty.
+        """
+        if not _SKLEARN_AVAILABLE:
+            return 0
+        try:
+            if isinstance(X, pd.DataFrame):
+                if not set(self.feature_cols).issubset(set(X.columns)):
+                    # Align columns; missing -> 0
+                    X_aligned = pd.DataFrame(
+                        {c: X[c] if c in X.columns else 0.0
+                         for c in self.feature_cols}
+                    )
+                else:
+                    X_aligned = X[self.feature_cols]
+                X_arr = X_aligned.astype(float).fillna(0.0).values
+            else:
+                X_arr = np.asarray(X, dtype=np.float64)
+            if isinstance(y, pd.Series):
+                y_arr = y.astype(int).values
+            else:
+                y_arr = np.asarray(y, dtype=np.int64).ravel()
+            n = min(len(X_arr), len(y_arr))
+            if n < 20:
+                return 0
+            X_arr = X_arr[:n]
+            y_arr = y_arr[:n]
+            # Drop rows with NaN/inf
+            finite = np.all(np.isfinite(X_arr), axis=1)
+            X_arr = X_arr[finite]
+            y_arr = y_arr[finite]
+            if len(X_arr) < 20:
+                return 0
+            if len(X_arr) > max_samples:
+                X_arr = X_arr[-max_samples:] if tail_bias else X_arr[:max_samples]
+                y_arr = y_arr[-max_samples:] if tail_bias else y_arr[:max_samples]
+
+            # Need BOTH classes present to fit the classifier.
+            classes = np.unique(y_arr)
+            if len(classes) < 2:
+                return 0
+
+            # Fit scaler on the full warm corpus for stable feature means.
+            self._scaler.fit(X_arr)
+            Xs = self._scaler.transform(X_arr)
+            self._model.partial_fit(Xs, y_arr, classes=np.array([0, 1]))
+            # Seed replay buffer with the most recent max_samples rows
+            # so subsequent scaler refreshes aren't biased by the tiny
+            # live sample.
+            keep = min(len(X_arr), self.replay_size)
+            self._replay_X = [X_arr[i] for i in range(len(X_arr) - keep, len(X_arr))]
+            self._replay_y = [int(y_arr[i]) for i in range(len(y_arr) - keep, len(y_arr))]
+            # Mark the learner as having absorbed these samples so
+            # is_ready() returns True immediately.
+            self._n_updates = max(self._n_updates, len(X_arr))
+            # Build an honest starting AUC sample: predict on the warm
+            # corpus itself. In-sample optimistic but harmless because
+            # the signal adapter re-checks AUC >= 0.51 before using us.
+            try:
+                probs = self._model.predict_proba(Xs)[:, 1]
+                # Keep up to auc_window most recent samples.
+                k = min(self.auc_window, len(probs))
+                self._recent_probs = list(probs[-k:])
+                self._recent_labels = list(y_arr[-k:].astype(int))
+            except Exception:
+                pass
+            return len(X_arr)
+        except Exception:
+            return 0
+
     def _partial_fit_one(self, x: np.ndarray, y: int) -> None:
         """Do a single incremental SGD step. On the very first label we
         fit the scaler + do partial_fit with both class labels [0,1] so

@@ -69,6 +69,8 @@ async def simulate_one_day_v3(
     maker_tp: bool,
     online_blend_weight: float,
     adaptive_ev: bool,
+    warm_start_online: bool,
+    edge_auc_floor: float,
 ):
     """Run one day's sim, reusing the persistent online_learner."""
     sim_start_ms = sim_end_ms - 24 * 3600 * 1000
@@ -175,6 +177,18 @@ async def simulate_one_day_v3(
             elif best_auc < 0.55:
                 fw["ml"] = fw.get("ml", 1.0) * (best_auc - 0.51) / 0.04
 
+    # Warm-start the online head ONLY if it has not been trained yet
+    # (so persistent-mode gets seeded exactly once, on day 1). In
+    # `--reset-online on` mode, each day's fresh learner gets its own
+    # warm-start.
+    if warm_start_online and online_learner._n_updates == 0:
+        corpus = bundle.get("warm_corpus")
+        if corpus and corpus.get("X") is not None and corpus.get("y") is not None:
+            online_learner.warm_start_from_corpus(
+                corpus["X"], corpus["y"],
+                max_samples=2000, tail_bias=True,
+            )
+
     signal_fn, online_learner = make_signal_fn_v3(
         v2_predictor=predictor,
         online_learner=online_learner,
@@ -197,6 +211,7 @@ async def simulate_one_day_v3(
         sym_id_map=predictor.sym_id_map,
         adaptive_ev=adaptive_ev,
         online_blend_weight=online_blend_weight,
+        edge_auc_floor=edge_auc_floor,
     )
 
     def _on_close(trade, meta):
@@ -238,7 +253,7 @@ async def run_sweep(
     days, symbols, risk_percent, min_ev_pct, max_leverage,
     max_positions, starting_balance, train_chunks, fusion_weights, tf: TFConfig,
     maker_tp: bool, online_blend_weight: float, adaptive_ev: bool,
-    reset_online_daily: bool,
+    reset_online_daily: bool, warm_start_online: bool, edge_auc_floor: float,
 ):
     chunks = train_chunks if train_chunks is not None else tf.default_train_chunks
     now_ms = int(time.time() * 1000)
@@ -265,9 +280,11 @@ async def run_sweep(
         )
         console.print(
             f"[bold]Maker-TP[/]: {'ON' if maker_tp else 'OFF'}   "
-            f"[bold]Online blend[/]: {online_blend_weight}   "
+            f"[bold]Online blend max[/]: {online_blend_weight}   "
             f"[bold]Adaptive EV[/]: {'ON' if adaptive_ev else 'OFF'}   "
-            f"[bold]Reset online daily[/]: {'YES' if reset_online_daily else 'NO'}"
+            f"[bold]Reset daily[/]: {'YES' if reset_online_daily else 'NO'}   "
+            f"[bold]Warm start[/]: {'ON' if warm_start_online else 'OFF'}   "
+            f"[bold]Edge AUC floor[/]: {edge_auc_floor}"
         )
 
         # Single OnlineLearner persists across all days unless
@@ -297,6 +314,7 @@ async def run_sweep(
                 risk_percent, min_ev_pct, max_leverage,
                 max_positions, starting_balance, chunks, fusion_weights, tf,
                 day_learner, maker_tp, online_blend_weight, adaptive_ev,
+                warm_start_online, edge_auc_floor,
             )
             if result is None:
                 console.print("  [yellow]No data, skip.[/]")
@@ -424,6 +442,10 @@ def main():
     ap.add_argument("--w-online", type=float, default=0.3)
     ap.add_argument("--maker-tp", type=str, default="on", choices=["on", "off"])
     ap.add_argument("--adaptive-ev", type=str, default="on", choices=["on", "off"])
+    ap.add_argument("--warm-start", type=str, default="on", choices=["on", "off"],
+                    help="Warm-start online learner from ml_v2 training corpus")
+    ap.add_argument("--edge-auc", type=float, default=0.53,
+                    help="Refuse to trade when both classifiers' AUC < this")
     ap.add_argument(
         "--reset-online", type=str, default="off", choices=["on", "off"],
         help="If 'on', reset OnlineLearner each day (no cross-day learning)",
@@ -445,6 +467,8 @@ def main():
             online_blend_weight=args.w_online,
             adaptive_ev=(args.adaptive_ev == "on"),
             reset_online_daily=(args.reset_online == "on"),
+            warm_start_online=(args.warm_start == "on"),
+            edge_auc_floor=args.edge_auc,
         )
     )
 

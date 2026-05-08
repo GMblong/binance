@@ -85,6 +85,7 @@ def make_signal_fn_v3(
     sym_id_map: Optional[Dict[str, int]] = None,
     adaptive_ev: bool = True,
     online_blend_weight: float = 0.3,
+    edge_auc_floor: float = 0.53,
 ) -> Tuple[Callable[[Dict[str, Any]], Optional[Order]], OnlineLearner]:
     """Build a v3 signal_fn plus an `OnlineLearner` handle.
 
@@ -98,9 +99,15 @@ def make_signal_fn_v3(
 
     `adaptive_ev=True` scales min_ev_pct by recent classifier AUC so
     the gate tightens when the model degrades.
-    `online_blend_weight` controls how loud the online head is in the
-    final fusion. Default 0.3 is modest; can be raised once the live
-    AUC stabilizes above 0.55.
+    `online_blend_weight` is now a CEILING, not a fixed weight. The
+    actual weight is scaled from 0 (at online_auc <= 0.51) up to this
+    value (at online_auc >= 0.60) so the live head only gets loud
+    when it is demonstrably correct.
+    `edge_auc_floor` (default 0.53) is an AUC "trade gate". If neither
+    the frozen ML regime AUC nor the online AUC reaches this level,
+    we REFUSE to trade at all on that bar. v3 showed us that trading
+    through zero-edge days burned more in fees than the edge-days
+    earned back -- filtering them out is the single biggest win.
     """
 
     cost = cost_model or CostModel()
@@ -321,19 +328,25 @@ def make_signal_fn_v3(
         p_base_trade, _ = fuse_probabilities(
             p_tech, p_ml, p_flow, weights=fusion_weights
         )
-        # Now blend in the online head. Using a soft logit blend so the
-        # online output acts as a pure nudge, weighted by its blend_weight
-        # (0.3 by default; caller can lower for safety during warmup).
+        # Now blend in the online head with AUC-scaled weight. Observed
+        # in v3 7-day sweep: days 3 (OnlAUC 0.71) and 6 (0.53) were
+        # profitable; days 1-2 (warmup) and 5/7 (AUC ~0.51) were
+        # fee-bleed. The fix is to scale the weight proportional to
+        # current online AUC so a strong-AUC day gets full blend
+        # (boosting the winners) while a flat-AUC day gets zero blend
+        # (neutralizing the losers).
+        #
+        # AUC <= 0.51  -> w=0         (noise, don't pollute)
+        # AUC in 0.51..0.60 -> linear 0..online_blend_weight
+        # AUC >= 0.60  -> w=online_blend_weight (full ceiling)
         from ml_v2.fusion import logit, sigmoid
 
-        w_online = online_blend_weight
+        w_online = 0.0
         if online_learner is not None and online_learner.is_ready():
-            # Only let the online head participate once it has both an
-            # AUC signal and a reasonable sample count.
-            if online_auc < 0.51:
-                w_online *= 0.0
-        else:
-            w_online = 0.0
+            if online_auc >= 0.60:
+                w_online = online_blend_weight
+            elif online_auc > 0.51:
+                w_online = online_blend_weight * ((online_auc - 0.51) / 0.09)
         if w_online > 0:
             fused_logit = (
                 (1.0 - w_online) * logit(p_base_trade)
@@ -342,6 +355,17 @@ def make_signal_fn_v3(
             p_trade = sigmoid(fused_logit)
         else:
             p_trade = p_base_trade
+
+        # ---- Edge gate: refuse to trade when no classifier has edge ----
+        # If BOTH the frozen regime-specific AUC and the live online
+        # AUC are below `edge_auc_floor` (default 0.53), we are trading
+        # on technical + microstructure alone with fee headwind. In v2
+        # data those setups averaged negative EV. Skip the bar entirely.
+        # We do NOT skip during online warmup: the frozen ML AUC is
+        # allowed to carry us as long as ml_regime_auc >= edge_auc_floor.
+        best_classifier_auc = max(ml_regime_auc, online_auc)
+        if best_classifier_auc < edge_auc_floor:
+            return None
 
         # ---- Structural SL / entry / RR ----
         atr = d["atr"].iloc[idx]
@@ -498,6 +522,8 @@ def make_signal_fn_v3(
                 "regime": regime,
                 "ml_regime_auc": ml_regime_auc,
                 "online_auc": online_auc,
+                "w_online": w_online,
+                "edge_auc_floor": edge_auc_floor,
                 "cvd_div": cvd_div,
                 "cvd_abs": cvd_abs,
                 "funding_sig": funding_sig,

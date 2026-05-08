@@ -80,6 +80,8 @@ async def run_v3(
     maker_tp: bool = True,
     online_blend_weight: float = 0.3,
     adaptive_ev: bool = True,
+    warm_start_online: bool = True,
+    edge_auc_floor: float = 0.53,
 ):
     chunks = train_chunks if train_chunks is not None else tf.default_train_chunks
     bar_ms = _bar_ms(tf)
@@ -94,8 +96,10 @@ async def run_v3(
     )
     console.print(
         f"[bold]Maker-TP[/]: {'ON' if maker_tp else 'OFF'}   "
-        f"[bold]Online blend[/]: {online_blend_weight}   "
-        f"[bold]Adaptive EV[/]: {'ON' if adaptive_ev else 'OFF'}"
+        f"[bold]Online blend max[/]: {online_blend_weight}   "
+        f"[bold]Adaptive EV[/]: {'ON' if adaptive_ev else 'OFF'}   "
+        f"[bold]Warm start[/]: {'ON' if warm_start_online else 'OFF'}   "
+        f"[bold]Edge AUC floor[/]: {edge_auc_floor}"
     )
     console.print(
         f"[bold]Sim window[/]: "
@@ -280,6 +284,30 @@ async def run_v3(
         # the first ~30 trades are used purely for warmup.
         online_learner = OnlineLearner(feature_cols=list(FEATURE_COLUMNS))
 
+        # Warm-start the online head from the frozen LightGBM's own
+        # training corpus (same rows, same labels). This eliminates the
+        # ~30-trade warmup window that was pure fee-burn in v3 sweeps:
+        # observed days 1-2 with 12 and 25 online-updates respectively
+        # were both losing days before the online head became `is_ready`.
+        # After warm_start, the learner is_ready() from bar 1 and its
+        # recent_auc reflects the same in-sample edge as the LightGBM.
+        if warm_start_online:
+            corpus = bundle.get("warm_corpus")
+            if corpus and corpus.get("X") is not None and corpus.get("y") is not None:
+                n_warm = online_learner.warm_start_from_corpus(
+                    corpus["X"], corpus["y"],
+                    max_samples=2000, tail_bias=True,
+                )
+                if n_warm > 0:
+                    console.print(
+                        f"  [green]Online warm-started from corpus: "
+                        f"n={n_warm}, seed AUC={online_learner.recent_auc():.3f}[/]"
+                    )
+                else:
+                    console.print(
+                        "  [yellow]Online warm-start skipped (insufficient corpus)[/]"
+                    )
+
         signal_fn, online_learner = make_signal_fn_v3(
             v2_predictor=predictor,
             online_learner=online_learner,
@@ -302,6 +330,7 @@ async def run_v3(
             sym_id_map=predictor.sym_id_map,
             adaptive_ev=adaptive_ev,
             online_blend_weight=online_blend_weight,
+            edge_auc_floor=edge_auc_floor,
         )
 
         # Engine close-hook feeds the online learner. pnl > 0 => label 1
@@ -375,13 +404,18 @@ def main():
     ap.add_argument("--w-ml", type=float, default=1.0)
     ap.add_argument("--w-flow", type=float, default=0.5)
     ap.add_argument("--w-online", type=float, default=0.3,
-                    help="Blend weight of the online learner (0..1, default 0.3)")
+                    help="CEILING blend weight of the online learner (AUC-scaled 0..ceiling)")
     ap.add_argument("--maker-tp", type=str, default="on",
                     choices=["on", "off"],
                     help="Route TP exits as maker limit (halves win-side fee)")
     ap.add_argument("--adaptive-ev", type=str, default="on",
                     choices=["on", "off"],
                     help="Scale min EV threshold by recent classifier AUC")
+    ap.add_argument("--warm-start", type=str, default="on",
+                    choices=["on", "off"],
+                    help="Warm-start online learner from ml_v2 training corpus")
+    ap.add_argument("--edge-auc", type=float, default=0.53,
+                    help="Refuse to trade when both classifiers' AUC < this")
     ap.add_argument(
         "--train-chunks", type=int, default=None,
         help="Override default chunks for the chosen TF",
@@ -406,6 +440,8 @@ def main():
             maker_tp=(args.maker_tp == "on"),
             online_blend_weight=args.w_online,
             adaptive_ev=(args.adaptive_ev == "on"),
+            warm_start_online=(args.warm_start == "on"),
+            edge_auc_floor=args.edge_auc,
         )
     )
 
