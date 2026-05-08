@@ -26,6 +26,17 @@ class V2Predictor:
         self.models: Dict[str, Any] = bundle.get("models", {}) or {}
         self.sym_id_map: Dict[str, int] = bundle.get("sym_id_map", {}) or {}
         self.metrics: Dict[str, Any] = bundle.get("metrics", {}) or {}
+        # Regime thresholds learned during training: inference must use
+        # the same bucketing policy as training, otherwise the same bar
+        # could be routed to a different sub-model than the one that saw
+        # it during training.
+        self.regime_thresholds: Dict[str, float] = bundle.get(
+            "regime_thresholds"
+        ) or {
+            "atr_vol_hi": 1.2,
+            "atr_trend_lo": 0.20,
+            "dist_trend_lo": 0.0015,
+        }
         # Extract per-regime AUC so callers can weight ML dynamically.
         self.regime_auc: Dict[str, float] = {}
         for reg, m in self.metrics.get("per_regime", {}).items():
@@ -68,7 +79,12 @@ class V2Predictor:
         )
         if feats.empty:
             return 0.5
-        regime_series = assign_regime(feats)
+        regime_series = assign_regime(
+            feats,
+            atr_vol_hi=self.regime_thresholds["atr_vol_hi"],
+            atr_trend_lo=self.regime_thresholds["atr_trend_lo"],
+            dist_trend_lo=self.regime_thresholds["dist_trend_lo"],
+        )
         if regime_series.empty:
             return 0.5
         regime = str(regime_series.iloc[-1])
