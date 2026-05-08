@@ -148,8 +148,23 @@ def build_feature_matrix(
     out["vol_z"] = (v - vol_mean) / vol_std
 
     # BTC context
-    if btc_close is not None and len(btc_close) >= len(df):
-        btc = btc_close.reindex(df.index).ffill()
+    if btc_close is not None and len(btc_close) > 0:
+        # `btc_close` typically has its index set to the bar open-time
+        # (`ot` in ms). Reindexing onto `df.index` (0..N-1 positional)
+        # would return 100% NaN and silently kill every BTC feature --
+        # which in turn makes dropna(subset=FEATURE_COLUMNS) drop ALL
+        # rows and ml_v2 "could not train any regime model" fall back.
+        # So: prefer ot-based alignment when the caller gives us one.
+        try:
+            if "ot" in df.columns:
+                btc = pd.Series(
+                    btc_close.reindex(df["ot"].values).ffill().values,
+                    index=df.index,
+                )
+            else:
+                btc = btc_close.reindex(df.index).ffill()
+        except Exception:
+            btc = pd.Series(np.nan, index=df.index)
         out["btc_ret_1"] = btc.pct_change(1)
         out["btc_ret_5"] = btc.pct_change(5)
         out["btc_ret_15"] = btc.pct_change(15)
@@ -186,11 +201,17 @@ def build_feature_matrix(
     # Funding
     if funding_series is not None and len(funding_series) > 0:
         try:
-            ts_ms = df["ot"].astype("int64")
-            aligned = pd.Series(
-                funding_series.reindex(ts_ms.values, method="ffill").values,
-                index=df.index,
-            )
+            ts_ms = df["ot"].astype("int64") if "ot" in df.columns else pd.Series(df.index)
+            # funding_series is indexed by fundingTime ms. Use `asof` per-row
+            # to carry the last known rate forward without NaN spam.
+            rates = []
+            sorted_fs = funding_series.sort_index()
+            for v in ts_ms.values:
+                try:
+                    rates.append(float(sorted_fs.asof(int(v))))
+                except Exception:
+                    rates.append(np.nan)
+            aligned = pd.Series(rates, index=df.index)
             out["funding_rate"] = aligned.astype(float)
             out["funding_skew"] = aligned.apply(funding_skew)
         except Exception:
@@ -207,11 +228,16 @@ def build_feature_matrix(
         out["oi_roc3"] = 0.0
 
     # Cross-section rank
-    if cross_section is not None and symbol is not None:
+    if cross_section is not None and symbol is not None and symbol in cross_section.columns:
         try:
-            sym_ret = cross_section[symbol].reindex(df.index).ffill()
-            ranks = cross_section.reindex(df.index).ffill().rank(axis=1, pct=True)
-            out["cs_rank_1h"] = ranks[symbol]
+            if "ot" in df.columns:
+                ot_vals = df["ot"].astype("int64").values
+                cs_aligned = cross_section.sort_index().reindex(ot_vals, method="ffill")
+                ranks = cs_aligned.rank(axis=1, pct=True)
+                out["cs_rank_1h"] = pd.Series(ranks[symbol].values, index=df.index).fillna(0.5)
+            else:
+                ranks = cross_section.reindex(df.index).ffill().rank(axis=1, pct=True)
+                out["cs_rank_1h"] = ranks[symbol]
         except Exception:
             out["cs_rank_1h"] = 0.5
     else:

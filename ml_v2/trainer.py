@@ -85,10 +85,29 @@ def train_pooled(
             sym_id_map=sym_id_map,
         )
         regime = assign_regime(feats)
-        # Align and drop NaN
+        n_before = len(feats)
+        # Do NOT drop rows where only a handful of columns are NaN -- those
+        # are warm-up bars. Require the label and the core price features
+        # only; fill the rest with the per-column median.
+        core_cols = [
+            c for c in ["atr_pct", "ret_1", "dist_ema21", "rsi14"]
+            if c in feats.columns
+        ]
         joined = feats.join(y_bin.rename("y")).join(regime.rename("regime"))
-        joined = joined.dropna(subset=["y"] + FEATURE_COLUMNS)
-        if len(joined) < 150:
+        joined = joined.dropna(subset=["y"] + core_cols)
+        # Fill remaining NaNs in canonical feature list so LightGBM doesn't
+        # silently mark them as a category.
+        for col in FEATURE_COLUMNS:
+            if col in joined.columns:
+                joined[col] = joined[col].astype(float)
+                if joined[col].isna().any():
+                    med = joined[col].median()
+                    fill = 0.0 if not np.isfinite(med) else float(med)
+                    joined[col] = joined[col].fillna(fill)
+            else:
+                joined[col] = 0.0
+        n_after = len(joined)
+        if n_after < 150:
             continue
         # Sample weight: down-weight low ATR regime bars
         w = 1.0 + (joined["atr_pct"].clip(0.1, 3.0) / 3.0)
@@ -113,7 +132,7 @@ def train_pooled(
     w_all = w_all.iloc[order].reset_index(drop=True)
 
     models: Dict[str, Any] = {}
-    metrics: Dict[str, Any] = {"per_regime": {}}
+    metrics: Dict[str, Any] = {"per_regime": {}, "total_rows": int(len(X_all))}
     # Minimum samples to train a regime-specific model. With 5 symbols *
     # 10_000 bars we get ~50k rows, so even the least common regime
     # usually has several thousand. 150 is low but safe.

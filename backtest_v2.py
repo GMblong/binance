@@ -189,6 +189,17 @@ async def run_v2(
                 "falling back to neutral P_ml=0.5. Microstructure + "
                 "technical still active.[/]"
             )
+            total_rows = bundle.get("metrics", {}).get("total_rows", 0)
+            console.print(
+                f"  [dim]Total trainable rows after feature+label filter: {total_rows}[/dim]"
+            )
+            for reg, m in bundle.get("metrics", {}).get("per_regime", {}).items():
+                console.print(f"  [dim]regime={reg}: n={m.get('n', 0)} (min=150)[/dim]")
+            # If ML is off, reduce ML weight in fusion so P_ml=0.5 doesn't
+            # drag decisions toward random. Tech + flow will carry us.
+            if fusion_weights is not None:
+                fusion_weights = dict(fusion_weights)
+                fusion_weights["ml"] = 0.0
         else:
             pr = bundle.get("metrics", {}).get("per_regime", {})
             for reg, m in pr.items():
