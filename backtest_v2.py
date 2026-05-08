@@ -50,17 +50,27 @@ init_db()
 load_state_from_db()
 
 
-async def fetch_training_1m(client, symbol, end_time_ms):
-    """Fetch ~2500 minutes of 1m bars ending at end_time_ms."""
-    # Binance caps limit=1500; do two back-to-back fetches for more history.
-    df_a = await fetch_klines(client, symbol, "1m", limit=1500, end_time=end_time_ms)
-    if df_a is None or df_a.empty:
+async def fetch_training_1m(client, symbol, end_time_ms, chunks: int = 7):
+    """Fetch N * 1500 minutes of 1m bars ending at end_time_ms.
+
+    Default `chunks=7` gives ~10500 minutes ≈ 7 days of 1m bars, which
+    is the minimum for a pooled regime-conditional LightGBM to converge.
+    Earlier versions only fetched 2*1500 minutes which left each regime
+    with < 300 samples and ml_v2 silently fell back to P_ml=0.5.
+    """
+    frames = []
+    cursor = end_time_ms
+    for _ in range(chunks):
+        df = await fetch_klines(client, symbol, "1m", limit=1500, end_time=cursor)
+        if df is None or df.empty:
+            break
+        frames.append(df)
+        cursor = int(df["ot"].iloc[0]) - 60_000
+        if cursor <= 0:
+            break
+    if not frames:
         return pd.DataFrame()
-    earliest = int(df_a["ot"].iloc[0])
-    df_b = await fetch_klines(client, symbol, "1m", limit=1500, end_time=earliest - 60_000)
-    if df_b is None or df_b.empty:
-        return df_a
-    full = pd.concat([df_b, df_a], ignore_index=True).drop_duplicates("ot").sort_values("ot")
+    full = pd.concat(frames, ignore_index=True).drop_duplicates("ot").sort_values("ot")
     return full.reset_index(drop=True)
 
 
@@ -97,6 +107,7 @@ async def run_v2(
     max_leverage: int,
     starting_balance: float,
     fusion_weights: dict | None,
+    train_chunks: int = 7,
     max_positions: int = 3,
 ):
     now_ms = int(time.time() * 1000)
@@ -130,13 +141,14 @@ async def run_v2(
             console.print(f"Using symbols: {symbols}")
 
         # -------- Training corpus (ends BEFORE sim_start_ms) --------
-        console.print("[dim]Fetching training corpus...[/dim]")
+        console.print(f"[dim]Fetching training corpus ({train_chunks} chunks ~{train_chunks*1500}m per symbol)...[/dim]")
         train_per_symbol = {}
         for s in symbols:
-            df = await fetch_training_1m(client, s, train_end_ms)
+            df = await fetch_training_1m(client, s, train_end_ms, chunks=train_chunks)
             if df is not None and not df.empty:
                 train_per_symbol[s] = df
-        btc_train = await fetch_training_1m(client, "BTCUSDT", train_end_ms)
+                console.print(f"  [dim]{s}: {len(df)} bars[/dim]")
+        btc_train = await fetch_training_1m(client, "BTCUSDT", train_end_ms, chunks=train_chunks)
         if btc_train is None or btc_train.empty:
             console.print("[red]No BTC training data; aborting.[/]")
             return
@@ -279,6 +291,8 @@ def main():
     ap.add_argument("--w-tech", type=float, default=0.6)
     ap.add_argument("--w-ml", type=float, default=1.0)
     ap.add_argument("--w-flow", type=float, default=0.5)
+    ap.add_argument("--train-chunks", type=int, default=7,
+                    help="Fetch N*1500 bars for training (default 7 => ~1 week)")
     args = ap.parse_args()
 
     syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -293,6 +307,7 @@ def main():
             max_leverage=args.max_lev,
             starting_balance=args.balance,
             fusion_weights=fw,
+            train_chunks=args.train_chunks,
         )
     )
 

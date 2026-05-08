@@ -1,22 +1,45 @@
 """Symbol selection: pick coins by liquidity + trend persistence, NOT by
 abs(price_change_percent) of the last 24h.
 
-`get_top_movers` in the legacy scripts ranked by volatility, which is
-exactly how retail gets farmed. This picker biases toward:
-
-  - quoteVolume >= threshold (liquidity)
-  - tight enough spread proxy (bidPrice / askPrice)
-  - recent trend persistence (|realized 4h return| / realized 4h stdev)
-
-Coins with a very large 1h range vs their 24h average (recent blow-off) are
-excluded -- they are likely exhausted.
+Also EXCLUDES non-crypto perpetuals (commodities like CL, XAG, stock/index
+tokens) because their behavior and historical data density are very
+different from crypto -- feeding them into the ML trainer corrupts pooled
+learning.
 """
 
 from __future__ import annotations
 
-from typing import List
+from typing import List, Set
 
 import pandas as pd
+
+
+NON_CRYPTO_BASES: Set[str] = {
+    "CL",       # Crude oil
+    "XAG",      # Silver
+    "XAU",      # Gold
+    "USOIL",
+    "NATGAS",
+    "BRENT",
+    "WTI",
+    "SPX",
+    "NDX",
+    "DJI",
+    "DAX",
+    "NIKKEI",
+    "HSI",
+}
+
+
+def _is_crypto_symbol(sym: str) -> bool:
+    if not sym.endswith("USDT"):
+        return False
+    if any(x in sym for x in ("_", "-", ".")):
+        return False
+    base = sym[:-4]
+    if not base or base in NON_CRYPTO_BASES:
+        return False
+    return True
 
 
 DEFAULT_FALLBACK = [
@@ -51,10 +74,7 @@ async def select_liquid_trending(
         rows = []
         for t in data:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT") or sym.endswith("_USDT"):
-                continue
-            # Skip inverse / quarterly contracts that sometimes sneak in.
-            if any(x in sym for x in ("_", "-")):
+            if not _is_crypto_symbol(sym):
                 continue
             try:
                 qv = float(t["quoteVolume"])

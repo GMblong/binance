@@ -114,9 +114,13 @@ def train_pooled(
 
     models: Dict[str, Any] = {}
     metrics: Dict[str, Any] = {"per_regime": {}}
+    # Minimum samples to train a regime-specific model. With 5 symbols *
+    # 10_000 bars we get ~50k rows, so even the least common regime
+    # usually has several thousand. 150 is low but safe.
+    min_regime_samples = 150
     for regime in REGIMES:
         mask = (r_all == regime).values
-        if mask.sum() < 300:
+        if mask.sum() < min_regime_samples:
             metrics["per_regime"][regime] = {"skipped": True, "n": int(mask.sum())}
             continue
         X_r = X_all.loc[mask].reset_index(drop=True)
