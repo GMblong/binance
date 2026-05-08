@@ -196,8 +196,23 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
             col = "green" if pnl > 0 else "red"
             bot_state["last_log"] = f"[bold {col}]CLOSED {symbol} ({reason}) | Est. PnL: {pnl:+.2f}%[/]"
             
-            # Update ML Predictor Performance
-            ml_predictor.update_performance(symbol, pnl > 0)
+            # Update ML Predictor Performance & Bot State (Direct fallback to ensure UI updates)
+            is_win = pnl > 0
+            ml_predictor.update_performance(symbol, is_win)
+            if is_win:
+                bot_state["wins"] = bot_state.get("wins", 0) + 1
+            else:
+                bot_state["losses"] = bot_state.get("losses", 0) + 1
+            
+            # Update Symbol Performance
+            if symbol not in bot_state["sym_perf"]: bot_state["sym_perf"][symbol] = {'w':0, 'l':0, 'c':0}
+            if is_win:
+                bot_state["sym_perf"][symbol]['w'] += 1
+                bot_state["sym_perf"][symbol]['c'] = 0
+            else:
+                bot_state["sym_perf"][symbol]['l'] += 1
+                bot_state["sym_perf"][symbol]['c'] += 1
+                bot_state["sym_perf"][symbol]['last_loss_time'] = time.time()
             
             # W/L and Exact Daily PNL is now tracked via WebSocket's Realized Profit (rp) event
             if symbol in bot_state["trades"]: del bot_state["trades"][symbol]
@@ -244,7 +259,7 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
 
         reason = None
         
-        # 1. Trailing Stop Logic (Fast Check)
+        # 1. Trailing Stop & Breakeven Logic (Fast Check)
         trail_act = ai.get("ts_act", 0.8)
         base_cb = ai.get("ts_cb", 0.25)
         market_vol = bot_state.get("market_vol", 1.0)
@@ -259,6 +274,16 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         if peak_pnl >= trail_act and (peak_pnl - pnl_pct) >= current_cb:
             reason = f"AI-TRAIL {pnl_pct:.2f}% (CB: {current_cb:.2f}%)"
 
+        # Smart Breakeven Logic
+        initial_sl_pct = ai.get("sl", 1.0)
+        if not reason and pnl_pct >= initial_sl_pct:
+            # If we hit RR 1:1, ensure we don't lose money on this trade anymore.
+            # We don't close it yet, but we will exit if it drops back to BE.
+            # Fee buffer: 0.1% to cover entry and exit taker fees
+            be_buffer = 0.1 
+            if peak_pnl >= initial_sl_pct and pnl_pct <= be_buffer:
+                reason = "SMART-BE (Hit RR 1:1 and dropped)"
+
         # 2. Smart Reversal & Momentum Check
         if EXIT_ON_REVERSAL and not reason and all_signals:
             sym_short = symbol.replace("USDT", "")
@@ -268,15 +293,25 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
                 curr_score = curr_sig.get("score", 0)
                 ml_prob = curr_sig["ai"].get("ml_prob", 0.5)
                 
+                # Check VSA logic if market data is available
+                vsa_sig = 0
+                k1m = market_data.klines.get(symbol, {}).get("1m")
+                if k1m is not None:
+                    vsa_sig = MarketAnalyzer.detect_vsa_signals(k1m)
+                
+                # Reversal Logic
                 if side == "LONG" and sig_dir == -1 and ml_prob < 0.4:
                     reason = "AI-REVERSAL (BEARISH)"
                 elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.6:
                     reason = "AI-REVERSAL (BULLISH)"
                 elif pnl_pct > 0.3:
+                    # Momentum Dead Logic (Sharpened with VSA)
                     if side == "LONG" and curr_score < 30 and ml_prob < 0.5:
-                        reason = "SMART-TP (MOMENTUM DEAD)"
+                        if vsa_sig == -1: reason = "SMART-TP (MOMENTUM DEAD + VSA BEARISH)"
+                        else: reason = "SMART-TP (MOMENTUM DEAD)"
                     elif side == "SHORT" and curr_score < 30 and ml_prob > 0.5:
-                        reason = "SMART-TP (MOMENTUM DEAD)"
+                        if vsa_sig == 1: reason = "SMART-TP (MOMENTUM DEAD + VSA BULLISH)"
+                        else: reason = "SMART-TP (MOMENTUM DEAD)"
 
         if reason:
             return await close_position_async(client, symbol, side, amt, reason, pnl_pct)

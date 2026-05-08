@@ -127,7 +127,7 @@ async def analyze_hybrid_async(client, symbol):
             s_weights = bot_state.get("neural_weights")
             
         score = MarketAnalyzer.calculate_score(d1m, d15m, direction, imbalance, funding, regime, s_weights, session, lead_lag)
-        struct, _ = MarketAnalyzer.detect_structure(d1m)
+        struct, _, recent_high, recent_low = MarketAnalyzer.detect_structure(d1m)
         
         # --- MACHINE LEARNING INTEGRATION ---
         # Predict UP probability (0.0 to 1.0)
@@ -164,18 +164,38 @@ async def analyze_hybrid_async(client, symbol):
             if fvg and fvg["type"] == "BEARISH":
                 limit_p = fvg["bottom"]
 
-        # --- SMART VOLATILITY RISK (ATR Based) ---
-        # SL = 2.97x ATR (minimum 0.7%, maximum 3%)
-        sl_pct = max(0.7, min(3.0, (atr * 2.97 / price * 100)))
+        # --- SMART MARKET STRUCTURE SL & TP ---
+        base_atr_pct = (atr / price) * 100
+        buffer_pct = base_atr_pct * 0.2 # 0.2x ATR buffer
         
-        # Adaptive RR: Use optimized 2.08x
-        rr_mult = 2.08
+        ob = MarketAnalyzer.find_nearest_order_block(d1m, price, direction)
+        
+        if direction == 1:
+            # LONG SL: Below Order Block or Recent Low
+            sl_price = ob["bottom"] if ob else (recent_low if recent_low else price * (1 - 0.01))
+            sl_pct = ((price - sl_price) / price * 100) + buffer_pct
+        else:
+            # SHORT SL: Above Order Block or Recent High
+            sl_price = ob["top"] if ob else (recent_high if recent_high else price * (1 + 0.01))
+            sl_pct = ((sl_price - price) / price * 100) + buffer_pct
+            
+        # Fallback & Safety bounds
+        sl_pct = max(0.5, min(sl_pct, 4.0)) # Hard cap min 0.5%, max 4.0%
+        
+        # Adaptive RR based on Regime and ML Confidence
+        rr_mult = 2.0
+        if regime == "RANGING":
+            rr_mult = 1.5  # Quick scalps in ranging market
+        elif regime == "TRENDING":
+            if (direction == 1 and ml_prob > 0.65) or (direction == -1 and ml_prob < 0.35):
+                rr_mult = 2.5 # Higher conviction = higher reward target
+        
         tp_pct = sl_pct * rr_mult
         
-        # Breakout detection
-        prev_5_high = d1m['h'].iloc[-6:-1].max()
-        prev_5_low = d1m['l'].iloc[-6:-1].min()
-        is_breakout = (direction == 1 and price > prev_5_high) or (direction == -1 and price < prev_5_low)
+        # Breakout detection (structural, not just 5 candles which is too noisy)
+        prev_15_high = d1m['h'].iloc[-16:-1].max()
+        prev_15_low = d1m['l'].iloc[-16:-1].min()
+        is_breakout = (direction == 1 and price > prev_15_high) or (direction == -1 and price < prev_15_low)
         
         # Logika Baru: Adaptive Threshold berdasarkan Regime & Breakout
         threshold = 75
@@ -191,13 +211,14 @@ async def analyze_hybrid_async(client, symbol):
         is_market_order = False
         
         if regime == "TRENDING":
-            # In Trending markets, we are more aggressive to avoid missing the move
-            if score >= 95 or is_breakout:
+            # In Trending markets, ONLY FOMO/Market Execute if it's a breakout AND conviction is high (>=88)
+            # or if the overall score is absolutely extreme (>=95)
+            if (is_breakout and score >= 88) or score >= 95:
                 is_market_order = True
                 limit_p = price # Market Execution
         elif regime == "VOLATILE":
             # In Volatile markets, we ONLY use market orders if it's a confirmed breakout with extreme score
-            if score >= 97 and is_breakout:
+            if is_breakout and score >= 95:
                 is_market_order = True
                 limit_p = price
         # In RANGING mode, we stay 100% Sniper (Limit Only)

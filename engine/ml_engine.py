@@ -53,15 +53,21 @@ class MLPredictor:
         df['MACD_12_26_9'] = exp1 - exp2
         df['MACDs_12_26_9'] = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
         df['MACDh_12_26_9'] = df['MACD_12_26_9'] - df['MACDs_12_26_9']
+        
+        # Higher Time Frame Proxies (using 1m data)
+        df['ema_60'] = ta.ema(df['c'], length=60)
+        df['ema_240'] = ta.ema(df['c'], length=240)
             
         # Institutional Flow Proxies (VWAP & CVD)
         df['typical_price'] = (df['h'] + df['l'] + df['c']) / 3
         df['vwap'] = (df['typical_price'] * df['v']).cumsum() / df['v'].cumsum()
         df['dist_vwap'] = (df['c'] - df['vwap']) / df['vwap']
         
-        # CVD Proxy
-        df['dir_vol'] = np.where(df['c'] > df['o'], df['v'], -df['v'])
-        df['cvd'] = df['dir_vol'].cumsum()
+        # Advanced CVD Proxy (Wick-based Volume Delta)
+        range_diff = df['h'] - df['l'] + 1e-8
+        buy_vol = df['v'] * ((df['c'] - df['l']) / range_diff)
+        sell_vol = df['v'] * ((df['h'] - df['c']) / range_diff)
+        df['cvd'] = (buy_vol - sell_vol).cumsum()
         df['cvd_roc'] = df['cvd'].pct_change(3)
         
         # 2. Institutional Flow (OI & Funding)
@@ -94,13 +100,23 @@ class MLPredictor:
     def apply_triple_barrier(self, df, pt_mult=1.5, sl_mult=1.0, lookahead=12):
         targets = []
         prices, atrs, highs, lows = df['c'].values, df['atr'].values, df['h'].values, df['l'].values
+        
+        # Adaptive Multipliers based on recent median ATR to normalize volatility regimes
+        recent_median_atr = df['atr'].rolling(100).median().bfill().values
+        
         for i in range(len(df)):
             if i + lookahead >= len(df):
                 targets.append(np.nan)
                 continue
-            entry_price, current_atr = prices[i], atrs[i]
-            pt_price, sl_price = entry_price + (current_atr * pt_mult), entry_price - (current_atr * sl_mult)
-            label = np.nan
+            entry_price, current_atr, base_atr = prices[i], atrs[i], recent_median_atr[i]
+            
+            # Scale the multipliers: if current ATR is very high compared to base, widen the barrier
+            vol_ratio = current_atr / (base_atr + 1e-8)
+            dyn_pt_mult = pt_mult * min(max(vol_ratio, 0.8), 2.0)
+            dyn_sl_mult = sl_mult * min(max(vol_ratio, 0.8), 2.0)
+            
+            pt_price, sl_price = entry_price + (current_atr * dyn_pt_mult), entry_price - (current_atr * dyn_sl_mult)
+            label = np.nan # 1 = Hit PT, 0 = Hit SL, nan = Timeout (Chop)
             for j in range(1, lookahead + 1):
                 idx = i + j
                 if highs[idx] >= pt_price: label = 1; break
@@ -139,7 +155,8 @@ class MLPredictor:
             features = self._get_feature_list(df_sync.columns)
             X, y = df_sync[features], df_sync['target']
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, shuffle=False)
-            model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15, subsample=0.8, colsample_bytree=0.8, random_state=42, n_jobs=2, verbose=-1)
+            # Add class_weight='balanced' to handle skewed labeling (more stops hit than targets or vice versa)
+            model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=2, verbose=-1)
             model.fit(X_train, y_train)
             self.models[symbol], self.last_trained[symbol] = model, time.time()
             return True

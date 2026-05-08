@@ -177,11 +177,13 @@ class WebSocketManager:
                                                     if len(self._processed_orders) > 200: self._processed_orders.pop() # Keep it small
                                                     
                                                     if rp > 0:
+                                                        ml_predictor.update_performance(sym, True)
                                                         bot_state["wins"] = bot_state.get("wins", 0) + 1
                                                         if sym not in bot_state["sym_perf"]: bot_state["sym_perf"][sym] = {'w':0, 'l':0, 'c':0}
                                                         bot_state["sym_perf"][sym]['w'] += 1
                                                         bot_state["sym_perf"][sym]['c'] = 0
                                                     else:
+                                                        ml_predictor.update_performance(sym, False)
                                                         bot_state["losses"] = bot_state.get("losses", 0) + 1
                                                         if sym not in bot_state["sym_perf"]: bot_state["sym_perf"][sym] = {'w':0, 'l':0, 'c':0}
                                                         bot_state["sym_perf"][sym]['l'] += 1

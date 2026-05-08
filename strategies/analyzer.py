@@ -121,15 +121,22 @@ class MarketAnalyzer:
 
     @staticmethod
     def detect_structure(df):
-        if len(df) < 10: return "CHOP", False
+        if len(df) < 10: return "CHOP", False, None, None
         try:
-            # Simple Higher High / Lower Low logic
+            # Enhanced Structure with exact Swing High/Low levels
             h = df['h'].tail(5)
             l = df['l'].tail(5)
-            if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]: return "BULLISH", False
-            if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]: return "BEARISH", False
-            return "CHOP", False
-        except: return "CHOP", False
+            
+            # Find the actual swing points in the recent window
+            recent_high = df['h'].tail(15).max()
+            recent_low = df['l'].tail(15).min()
+            
+            if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]: 
+                return "BULLISH", False, recent_high, recent_low
+            if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]: 
+                return "BEARISH", False, recent_high, recent_low
+            return "CHOP", False, recent_high, recent_low
+        except: return "CHOP", False, None, None
 
     @staticmethod
     def calculate_score(d1m, d15m, direction, imbalance=1.0, funding=0.0, regime="RANGING", neural_weights=None, session="QUIET", lead_lag=0):
@@ -195,8 +202,8 @@ class MarketAnalyzer:
 
             # 6. Advanced Analysis (Volume Profile, VSA, Fractal Confluence)
             # Fractal Confluence: Check if 1m structure aligns with 15m
-            s1m, _ = MarketAnalyzer.detect_structure(d1m)
-            s15m, _ = MarketAnalyzer.detect_structure(d15m)
+            s1m, _, _, _ = MarketAnalyzer.detect_structure(d1m)
+            s15m, _, _, _ = MarketAnalyzer.detect_structure(d15m)
             if direction == 1 and s1m == "BULLISH" and s15m == "BULLISH": score += 10
             elif direction == -1 and s1m == "BEARISH" and s15m == "BEARISH": score += 10
             
