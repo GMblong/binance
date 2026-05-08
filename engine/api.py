@@ -48,8 +48,15 @@ async def binance_request(client, method, endpoint, params=None):
                 if res.status_code == 400:
                     try:
                         err_data = res.json()
-                        if err_data.get("code") == -4130:
-                            return res # Silent return for existing SL/TP
+                        err_code = err_data.get("code")
+                        # Abaikan error benign agar tidak memicu Circuit Breaker
+                        # -4130: Order already exists
+                        # -4028: Leverage is not valid
+                        # -4046: No need to change margin type
+                        # -4509: TIF GTE (SL placement on empty pos)
+                        if err_code in [-4130, -4028, -4046, -4509]:
+                            return res # Silent return
+                        
                         bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
                     except:
