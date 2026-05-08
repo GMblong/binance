@@ -41,9 +41,11 @@ async def analyze_hybrid_async(client, symbol):
                     headers = {'User-Agent': 'Mozilla/5.0'}
                     if API_KEY: headers['X-MBX-APIKEY'] = API_KEY
                     
-                    res1 = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15)
-                    res15 = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15)
-                    res1h = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15)
+                    res1, res15, res1h = await asyncio.gather(
+                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15),
+                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15),
+                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15),
+                    )
                     
                     
                     if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
@@ -121,7 +123,10 @@ async def analyze_hybrid_async(client, symbol):
         if not s_weights:
             s_weights = bot_state.get("neural_weights")
             
-        score = MarketAnalyzer.calculate_score(d1m, d15m, direction, imbalance, funding, regime, s_weights, session, lead_lag)
+        score, active_features = MarketAnalyzer.calculate_score(
+            d1m, d15m, direction, imbalance, funding, regime, s_weights,
+            session, lead_lag, return_features=True,
+        )
         struct, _, recent_high, recent_low = MarketAnalyzer.detect_structure(d1m)
         
         # Penalize if 15m and 1h disagree (counter-trend = high risk)
@@ -161,6 +166,36 @@ async def analyze_hybrid_async(client, symbol):
             # If SHORT, price is drawn down to long_liq (liquidating longers)
             elif direction == -1 and any(p < price for p in liq["long_liq"]):
                 score = min(score + 5, 100)
+
+        # --- REAL CVD FROM aggTrade (tick-level aggressive flow) ---
+        # Falls back to 0 if buffer empty (symbol not in top-N subscription).
+        # CVD is *normalized* by recent dollar volume so the threshold is
+        # comparable across coins.
+        cvd_60s, cvd_n = market_data.get_live_cvd(symbol, window_sec=60)
+        cvd_300s, _ = market_data.get_live_cvd(symbol, window_sec=300)
+        if cvd_n >= 10:  # Need at least 10 trades in the window
+            # Normalize by the 1m candle's typical dollar volume
+            try:
+                last_candle = d1m.iloc[-1]
+                norm_dv = float(last_candle['v'] * last_candle['c']) + 1.0
+                cvd_ratio_60 = cvd_60s / norm_dv     # ~[-1, +1]
+                cvd_ratio_300 = cvd_300s / (norm_dv * 5.0)
+            except Exception:
+                cvd_ratio_60 = cvd_ratio_300 = 0.0
+
+            # Strong aggressive flow in our direction → bonus
+            if direction == 1:
+                if cvd_ratio_60 > 0.25 and cvd_ratio_300 > 0.15:
+                    score = min(score + 10, 100)
+                    active_features.append(f"{regime}:cvd_live")
+                elif cvd_ratio_60 < -0.25:  # Strong sells against LONG → penalty
+                    score = max(score - 15, 0)
+            else:  # SHORT
+                if cvd_ratio_60 < -0.25 and cvd_ratio_300 < -0.15:
+                    score = min(score + 10, 100)
+                    active_features.append(f"{regime}:cvd_live")
+                elif cvd_ratio_60 > 0.25:
+                    score = max(score - 15, 0)
         
         # --- ENTRY LOGIC (Smart Sniper with Fake-Move Detection) ---
         
@@ -192,6 +227,69 @@ async def analyze_hybrid_async(client, symbol):
         # Check if price is overextended from EMA (chasing)
         dist_from_ema21 = abs(price - MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]) / price * 100
         is_overextended = dist_from_ema21 > base_atr_pct * 2.5
+        
+        # --- MULTI-CANDLE FAKE MOVE DETECTION (3-candle sequence) ---
+        if not is_fake_move and len(d1m) >= 5:
+            is_fake_move = MarketAnalyzer.detect_multi_candle_fake(d1m, direction)
+        
+        # --- WYCKOFF PHASE CONTEXT ---
+        wyckoff = MarketAnalyzer.detect_wyckoff_phase(d15m)
+        # Block entries against Wyckoff phase
+        if direction == 1 and wyckoff == "DISTRIBUTION":
+            score = int(score * 0.5)  # Heavy penalty: buying into distribution
+        elif direction == -1 and wyckoff == "ACCUMULATION":
+            score = int(score * 0.5)  # Heavy penalty: shorting into accumulation
+        elif direction == 1 and wyckoff == "MARKUP":
+            score = min(score + 10, 100)  # Bonus: buying in markup phase
+            active_features.append(f"{regime}:wyckoff")
+        elif direction == -1 and wyckoff == "MARKDOWN":
+            score = min(score + 10, 100)  # Bonus: shorting in markdown phase
+            active_features.append(f"{regime}:wyckoff")
+        
+        # --- ORDERFLOW MICROSTRUCTURE ---
+        bid_vel, ask_vel, spoof_score = market_data.get_depth_velocity(symbol)
+        # If spoofing detected, treat as fake move
+        if spoof_score > 0.6:
+            is_fake_move = True
+        # Depth velocity confirmation
+        if direction == 1 and bid_vel > 0 and ask_vel < 0:
+            score = min(score + 5, 100)  # Bids growing, asks shrinking = bullish
+            active_features.append(f"{regime}:depth_vel")
+        elif direction == -1 and ask_vel > 0 and bid_vel < 0:
+            score = min(score + 5, 100)  # Asks growing, bids shrinking = bearish
+            active_features.append(f"{regime}:depth_vel")
+        
+        # --- HMM REGIME CONTEXT ---
+        hmm_regime = MarketAnalyzer.detect_hmm_regime(d15m)
+        if hmm_regime == "MOMENTUM" and regime == "TRENDING":
+            score = min(score + 5, 100)  # Double confirmation: rule-based + HMM agree
+            active_features.append(f"{regime}:hmm")
+        elif hmm_regime == "MEAN_REVERT" and regime == "RANGING":
+            score = min(score + 5, 100)  # Both say mean-revert
+            active_features.append(f"{regime}:hmm")
+        
+        # --- ICEBERG ORDER DETECTION ---
+        iceberg_bid, iceberg_ask = market_data.detect_iceberg(symbol)
+        if direction == 1 and iceberg_bid:
+            score = min(score + 10, 100)  # Hidden buyer supporting price
+            active_features.append(f"{regime}:iceberg")
+        elif direction == -1 and iceberg_ask:
+            score = min(score + 10, 100)  # Hidden seller capping price
+            active_features.append(f"{regime}:iceberg")
+        elif direction == 1 and iceberg_ask:
+            score = max(score - 10, 0)  # Hidden seller blocks our long
+        elif direction == -1 and iceberg_bid:
+            score = max(score - 10, 0)  # Hidden buyer blocks our short
+        
+        # --- MULTI-EXCHANGE DIVERGENCE ---
+        from engine.multi_exchange import bybit_feed
+        divergence = bybit_feed.get_divergence(symbol)
+        if direction == 1 and divergence > 0.03:
+            score = min(score + 8, 100)  # Bybit higher = Binance will follow up
+            active_features.append(f"{regime}:xchange")
+        elif direction == -1 and divergence < -0.03:
+            score = min(score + 8, 100)  # Bybit lower = Binance will follow down
+            active_features.append(f"{regime}:xchange")
         
         # 2. Smart limit price placement
         # Priority: Order Block > FVG > VWAP-area > EMA21 pullback
@@ -350,7 +448,8 @@ async def analyze_hybrid_async(client, symbol):
                 "tp": float(tp_pct), "sl": float(sl_pct), "limit_price": float(limit_p),
                 "ts_act": float(ts_act), "ts_cb": float(ts_cb),
                 "type": "SCALP", "regime": regime, "score": int(score), "ml_prob": float(round(ml_prob, 2)),
-                "is_market": is_market_order, "atr_pct": float(base_atr_pct)
+                "is_market": is_market_order, "atr_pct": float(base_atr_pct),
+                "active_features": list(active_features),
             }
         }
     except Exception as e:

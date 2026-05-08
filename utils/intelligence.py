@@ -108,37 +108,100 @@ def calculate_kelly_risk(symbol, win_rate=0.5, rr=2.0):
 def detect_lead_lag(symbol, leader="BTCUSDT"):
     """
     Robust lead-lag using correlation and return gap (H8).
+    Enhanced with cascade chain: BTC → ETH → sector leaders → alts
     """
     try:
         if symbol == leader: return 0
-        df_sym = market_data.klines.get(symbol, {}).get("1m")
-        df_lead = market_data.klines.get(leader, {}).get("1m")
         
-        if df_sym is None or df_lead is None or len(df_sym) < 30 or len(df_lead) < 30:
-            return 0
+        # Multi-level cascade: check ETH as intermediate leader for altcoins
+        cascade_leaders = ["BTCUSDT", "ETHUSDT"]
+        best_signal = 0
+        
+        for lead in cascade_leaders:
+            if symbol == lead:
+                continue
+            df_sym = market_data.klines.get(symbol, {}).get("1m")
+            df_lead = market_data.klines.get(lead, {}).get("1m")
             
-        sym_ret = df_sym['c'].pct_change().tail(30).fillna(0)
-        lead_ret = df_lead['c'].pct_change().tail(30).fillna(0)
-        
-        # Calculate Beta = Cov(sym, lead) / Var(lead)
-        cov = sym_ret.cov(lead_ret)
-        var_lead = lead_ret.var()
-        beta = cov / var_lead if var_lead != 0 else 0
-        
-        # Only valid if they generally move together (beta > 0.7)
-        if beta > 0.7:
-            # Check the gap over the last 5 candles
-            sym_recent = (df_sym['c'].iloc[-1] - df_sym['c'].iloc[-5]) / df_sym['c'].iloc[-5] * 100
-            lead_recent = (df_lead['c'].iloc[-1] - df_lead['c'].iloc[-5]) / df_lead['c'].iloc[-5] * 100
+            if df_sym is None or df_lead is None or len(df_sym) < 30 or len(df_lead) < 30:
+                continue
+                
+            sym_ret = df_sym['c'].pct_change().tail(30).fillna(0)
+            lead_ret = df_lead['c'].pct_change().tail(30).fillna(0)
             
-            # Use historical stdev for gap calculation
-            std_gap = (lead_ret - sym_ret).std() * 100
+            # Calculate Beta = Cov(sym, lead) / Var(lead)
+            cov = sym_ret.cov(lead_ret)
+            var_lead = lead_ret.var()
+            beta = cov / var_lead if var_lead != 0 else 0
             
-            if lead_recent > 0.3 and (lead_recent - sym_recent) > (2 * std_gap): 
-                return 1 # Bullish lag
-            if lead_recent < -0.3 and (sym_recent - lead_recent) > (2 * std_gap): 
-                return -1 # Bearish lag
+            # Only valid if they generally move together (beta > 0.5 for cascade)
+            if beta > 0.5:
+                # Check the gap over the last 3 candles (faster detection)
+                sym_recent = (df_sym['c'].iloc[-1] - df_sym['c'].iloc[-4]) / df_sym['c'].iloc[-4] * 100
+                lead_recent = (df_lead['c'].iloc[-1] - df_lead['c'].iloc[-4]) / df_lead['c'].iloc[-4] * 100
+                
+                std_gap = (lead_ret - sym_ret).std() * 100
+                if std_gap == 0: continue
+                
+                # Cascade signal: leader moved, follower hasn't caught up
+                gap = lead_recent - sym_recent
+                z_score = gap / std_gap
+                
+                if z_score > 1.5:
+                    signal = 1  # Bullish lag (leader up, alt hasn't followed)
+                elif z_score < -1.5:
+                    signal = -1  # Bearish lag
+                else:
+                    signal = 0
+                
+                # Stronger signal from BTC > ETH
+                weight = 1.0 if lead == "BTCUSDT" else 0.7
+                if abs(signal * weight) > abs(best_signal):
+                    best_signal = signal
         
-        return 0
+        return best_signal
     except:
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Neural-weights feedback loop (Bayesian credit assignment)
+# ---------------------------------------------------------------------------
+
+def update_feature_weights(active_features, is_win, min_samples: int = 8,
+                           min_weight: float = 0.4, max_weight: float = 1.6):
+    """Credit/penalize each active feature based on trade outcome.
+
+    - `strat_perf[feat] = [wins, losses]` is incremented.
+    - `neural_weights[feat]` is recomputed from win-rate with a trust factor
+      that grows with sample size (so cold features stay at 1.0).
+
+    Weight formula (Laplace-smoothed win rate, centered at 0.5):
+        wr      = (wins + 1) / (wins + losses + 2)
+        trust   = min(1.0, (wins + losses) / 30)
+        weight  = clip(1.0 + (wr - 0.5) * 2 * trust, min_weight, max_weight)
+
+    So a feature that wins 70% over 30+ trades gets ~1.4; one that wins 30%
+    gets ~0.6; fresh features stay at 1.0.
+    """
+    if not active_features:
+        return
+    perf = bot_state.setdefault("strat_perf", {})
+    weights = bot_state.setdefault("neural_weights", {})
+    for feat in active_features:
+        if feat not in perf:
+            perf[feat] = [0, 0]
+        if is_win:
+            perf[feat][0] += 1
+        else:
+            perf[feat][1] += 1
+        w, l = perf[feat]
+        total = w + l
+        if total < min_samples:
+            # Not enough data — keep neutral weight
+            weights.setdefault(feat, 1.0)
+            continue
+        wr = (w + 1) / (total + 2)  # Laplace smoothing
+        trust = min(1.0, total / 30.0)
+        weight = 1.0 + (wr - 0.5) * 2.0 * trust
+        weights[feat] = max(min_weight, min(max_weight, round(weight, 3)))

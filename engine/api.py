@@ -181,7 +181,14 @@ async def get_orderbook_imbalance(client, symbol):
     global last_imbalance_fetch
     now = time.time()
     
-    # Throttle requests to once every 10 seconds per symbol to prevent 429
+    # Prefer WebSocket depth data (updated every 500ms) over REST
+    depth_buf = market_data.depth_history.get(symbol)
+    if depth_buf and len(depth_buf) >= 1:
+        last_ts = depth_buf[-1][0]
+        if now - last_ts < 3:  # WS data is fresh (<3 sec old)
+            return market_data.imbalance.get(symbol, 1.0)
+    
+    # Fallback to REST if no WS depth data
     if now - last_imbalance_fetch.get(symbol, 0) < 10:
         return market_data.imbalance.get(symbol, 1.0)
         
@@ -192,9 +199,12 @@ async def get_orderbook_imbalance(client, symbol):
             bids = sum(float(b[1]) for b in data['bids'])
             asks = sum(float(a[1]) for a in data['asks'])
             
-            # Calculate imbalance ratio (Bids / Asks)
-            # > 1 means more bids (buying pressure), < 1 means more asks (selling pressure)
-            if asks == 0: asks = 1 # Prevent division by zero
+            top_bid_qty = float(data['bids'][0][1]) if data['bids'] else 0
+            top_ask_qty = float(data['asks'][0][1]) if data['asks'] else 0
+            
+            market_data.push_depth_snapshot(symbol, bids, asks, top_bid_qty, top_ask_qty)
+            
+            if asks == 0: asks = 1
             imbalance = bids / asks
             market_data.imbalance[symbol] = imbalance
             last_imbalance_fetch[symbol] = now

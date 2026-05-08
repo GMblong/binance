@@ -2,7 +2,7 @@ import httpx
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import TimeSeriesSplit
 from utils.config import API_URL
 import pandas_ta as ta
 import asyncio
@@ -17,11 +17,71 @@ class MLPredictor:
         self.feature_cache = {} # Cache for pre-calculated features {symbol: df}
         self.retrain_sem = asyncio.Semaphore(5) # Allow 5 concurrent retrains for fast startup
         self.startup_done = False
+        # Track running retrains so we don't dispatch the same symbol twice.
+        self._retraining = set()
+        # Drift-based retrain bookkeeping.
+        self.trades_since_train = {}  # {symbol: int}
+        self.last_drift_check = {}    # {symbol: ts}
 
     def update_performance(self, symbol, is_win):
         if symbol not in self.performance: self.performance[symbol] = []
         self.performance[symbol].append(is_win)
         if len(self.performance[symbol]) > 50: self.performance[symbol].pop(0)
+        # Increment trades-since-train counter for drift detection
+        self.trades_since_train[symbol] = self.trades_since_train.get(symbol, 0) + 1
+
+    def recent_win_rate(self, symbol, window: int = 15):
+        """Win rate over the last `window` trades, or None if insufficient."""
+        perf = self.performance.get(symbol, [])
+        if len(perf) < window:
+            return None
+        tail = perf[-window:]
+        return sum(tail) / len(tail)
+
+    def should_retrain(self, symbol, now=None) -> bool:
+        """Decide if a symbol's model is stale enough to warrant retraining.
+
+        Triggers (any one is enough):
+        - No model yet.
+        - Time-based: trained >12h ago (legacy behaviour).
+        - Performance drift: recent win rate <45% over last 15 trades AND
+          at least 15 trades have happened since last train.
+        - Trade count: 40+ closed trades since last train (guaranteed refresh).
+        """
+        import time as _t
+        now = now or _t.time()
+        if symbol not in self.models:
+            return True
+        last = self.last_trained.get(symbol, 0)
+        if (now - last) > 43200:  # 12h
+            return True
+        tst = self.trades_since_train.get(symbol, 0)
+        if tst >= 40:
+            return True
+        wr = self.recent_win_rate(symbol, window=15)
+        if wr is not None and wr < 0.45 and tst >= 15:
+            return True
+        return False
+
+    async def maybe_retrain(self, client, symbol):
+        """Dispatch a background retrain if needed + not already running."""
+        if symbol in self._retraining:
+            return False
+        if not self.should_retrain(symbol):
+            return False
+        self._retraining.add(symbol)
+
+        async def _go():
+            try:
+                async with self.retrain_sem:
+                    ok = await self.train_model(client, symbol)
+                if ok:
+                    self.trades_since_train[symbol] = 0
+            finally:
+                self._retraining.discard(symbol)
+
+        asyncio.create_task(_go())
+        return True
 
     def _get_feature_list(self, df_cols):
         features = [
@@ -138,28 +198,110 @@ class MLPredictor:
             return df
         except: return None
 
+    async def fetch_extended_data(self, client, symbol, interval="15m", total=1500):
+        """Fetch extended historical data by paginating backwards."""
+        all_dfs = []
+        end_time = None
+        per_req = 1500
+        remaining = total
+        while remaining > 0:
+            limit = min(per_req, remaining)
+            df = await self.fetch_historical_data(client, symbol, interval, limit, end_time)
+            if df is None or df.empty:
+                break
+            all_dfs.insert(0, df)
+            remaining -= len(df)
+            if len(df) < limit:
+                break
+            end_time = int(df['ot'].iloc[0]) - 1
+            await asyncio.sleep(0.1)
+        if not all_dfs:
+            return None
+        result = pd.concat(all_dfs, ignore_index=True).drop_duplicates(subset=['ot']).sort_values('ot').reset_index(drop=True)
+        return result
+
+    async def _inject_funding_oi(self, client, symbol, df):
+        """Inject real funding rate and OI data into training dataframe."""
+        from utils.state import market_data
+        try:
+            # Fetch funding rate history
+            res = await client.get(f"{API_URL}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": 100}, timeout=10)
+            funding_map = {}
+            if res and res.status_code == 200:
+                for f in res.json():
+                    funding_map[int(f['fundingTime'])] = float(f['fundingRate'])
+            
+            # Assign funding to nearest candle
+            if funding_map:
+                fund_times = sorted(funding_map.keys())
+                df['funding'] = 0.0
+                for ft in fund_times:
+                    mask = df['ot'] <= ft
+                    if mask.any():
+                        idx = mask[mask].index[-1]
+                        df.loc[idx:, 'funding'] = funding_map[ft]
+            
+            # Inject OI from live state or fetch
+            live_oi = market_data.oi.get(symbol, 0)
+            if live_oi > 0:
+                df['oi'] = live_oi  # Static fill (best effort for training)
+            else:
+                df['oi'] = 0
+            
+            # Fetch OI history if available
+            try:
+                oi_res = await client.get(f"{API_URL}/futures/data/openInterestHist", 
+                    params={"symbol": symbol, "period": "15m", "limit": 100}, timeout=10)
+                if oi_res and oi_res.status_code == 200:
+                    oi_data = oi_res.json()
+                    oi_map = {int(x['timestamp']): float(x['sumOpenInterest']) for x in oi_data}
+                    if oi_map:
+                        oi_times = sorted(oi_map.keys())
+                        for ot_val in oi_times:
+                            mask = (df['ot'] >= ot_val - 900000) & (df['ot'] <= ot_val + 900000)
+                            if mask.any():
+                                df.loc[mask, 'oi'] = oi_map[ot_val]
+            except:
+                pass
+        except:
+            if 'funding' not in df.columns: df['funding'] = 0.0
+            if 'oi' not in df.columns: df['oi'] = 0.0
+        return df
+
     async def train_model(self, client, symbol, end_time=None):
-        # 15m is more predictable (less noise), use as primary training interval
-        df = await self.fetch_historical_data(client, symbol, interval="15m", limit=500, end_time=end_time)
-        lookahead = 8  # ~2 hours forward
-        if df is None or len(df) < 200:
-            # Fallback to 1m with 1500 candles
-            df = await self.fetch_historical_data(client, symbol, interval="1m", limit=1500, end_time=end_time)
-            lookahead = 15
-            if df is None or len(df) < 500: return False
+        # Train on 1m data since predict() receives 1m candles — must match distribution
+        df = await self.fetch_extended_data(client, symbol, interval="1m", total=1500)
+        lookahead = 15  # 15 candles forward (~15 min)
+        if df is None or len(df) < 500:
+            # Fallback: 15m with adjusted lookahead
+            df = await self.fetch_extended_data(client, symbol, interval="15m", total=1500)
+            lookahead = 10
+            if df is None or len(df) < 300: return False
+        
+        # Inject real funding & OI data
+        df = await self._inject_funding_oi(client, symbol, df)
+        
         def _train_sync():
             df_sync = self.feature_engineering(df.copy())
             df_sync = self.apply_triple_barrier(df_sync, pt_mult=1.5, sl_mult=1.2, lookahead=lookahead)
             if len(df_sync) < 100: return False
             features = self._get_feature_list(df_sync.columns)
             X, y = df_sync[features], df_sync['target']
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-            model = lgb.LGBMClassifier(n_estimators=120, learning_rate=0.06, max_depth=5, num_leaves=20, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=-1, verbose=-1)
-            model.fit(X_train, y_train)
-            # Validate before deploy - reject bad models
-            test_acc = (model.predict(X_test) == y_test).mean()
-            if test_acc < 0.50: return False  # Model worse than random
-            self.models[symbol], self.last_trained[symbol] = model, time.time()
+            
+            # Walk-forward validation: 3 folds, train on past, test on future
+            tscv = TimeSeriesSplit(n_splits=3)
+            scores = []
+            last_model = None
+            for train_idx, test_idx in tscv.split(X):
+                m = lgb.LGBMClassifier(n_estimators=150, learning_rate=0.05, max_depth=6, num_leaves=25, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=-1, verbose=-1)
+                m.fit(X.iloc[train_idx], y.iloc[train_idx])
+                acc = (m.predict(X.iloc[test_idx]) == y.iloc[test_idx]).mean()
+                scores.append(acc)
+                last_model = m
+            
+            avg_acc = np.mean(scores)
+            if avg_acc < 0.52 or last_model is None: return False  # Stricter: must beat 52%
+            self.models[symbol], self.last_trained[symbol] = last_model, time.time()
             return True
         return await asyncio.to_thread(_train_sync)
 
@@ -175,12 +317,10 @@ class MLPredictor:
         now = time.time()
         if symbol not in self.models:
             if not await self.train_model(client, symbol): return 0.5
-        if (now - self.last_trained.get(symbol, 0)) > 43200:
-            # Throttle retraining with semaphore (M6)
-            async def _retrain_with_sem():
-                async with self.retrain_sem:
-                    await self.train_model(client, symbol)
-            asyncio.create_task(_retrain_with_sem())
+            self.trades_since_train[symbol] = 0
+        else:
+            # Non-blocking check: dispatch retrain if time/drift triggers fire.
+            asyncio.create_task(self.maybe_retrain(client, symbol))
         model = self.models.get(symbol)
         if model is None: return 0.5
         df = self.feature_engineering(current_df.tail(100).copy())

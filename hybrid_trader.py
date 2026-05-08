@@ -26,6 +26,7 @@ from strategies.hybrid import get_btc_trend, analyze_hybrid_async
 from utils.database import init_db, load_state_from_db, save_state_to_db
 from utils.intelligence import calculate_market_volatility, is_correlated_exposure
 from coin_screener import screen_coins
+from engine.multi_exchange import bybit_feed
 from utils.logger import init_logger, log_error
 
 console = Console()
@@ -117,11 +118,11 @@ async def trading_loop(client):
 
             # 3. Smart Coin Selection (Multi-Factor Screener)
             filtered = [t for t in market_data.tickers if t["q"] > 5_000_000]
-            top_symbols = screen_coins(filtered, top_n=15)
+            top_symbols = screen_coins(filtered, top_n=30)
             
             # TURBO UI Placeholder
             placeholder_results = []
-            for sym in top_symbols[:10]:
+            for sym in top_symbols[:20]:
                 k = market_data.klines.get(sym, {})
                 status = "SYNC (1m)" if "1m" not in k else "READY"
                 price_val = market_data.prices.get(sym, 0)
@@ -151,10 +152,10 @@ async def trading_loop(client):
                 await asyncio.to_thread(load_state_from_db)
 
             # 5. Analysis Phase (Concurrent and Smart - Parallel)
-            top_10 = top_symbols[:10] # Analisa paralel 10 koin
+            top_20 = top_symbols[:20]  # Analisa paralel 20 koin
             
-            # Scan top 10 plus any active positions and limit orders in parallel
-            scan_targets = list(set(top_10 + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
+            # Scan top 20 plus any active positions and limit orders in parallel
+            scan_targets = list(set(top_20 + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
                 
             market_data.current_scan_list = scan_targets
             
@@ -178,7 +179,7 @@ async def trading_loop(client):
             
             # Rebuild list for UI
             analysis_results = []
-            for t in top_10:
+            for t in top_20:
                 sym_short = t.replace("USDT", "")
                 if sym_short in current_results_map:
                     analysis_results.append(current_results_map[sym_short])
@@ -284,7 +285,7 @@ async def trading_loop(client):
                 await asyncio.to_thread(save_state_to_db)
                 bot_state["last_db_save"] = now
 
-            await asyncio.sleep(1.5) # Relaxed loop
+            await asyncio.sleep(max(0.5, min(2.0, 1.5 / max(bot_state.get("market_vol", 1.0), 0.5))))  # Adaptive: fast when volatile, slow when quiet
         except Exception as e:
             bot_state["last_log"] = f"[red]Loop Err: {str(e)[:40]}[/]"
             await asyncio.sleep(5)
@@ -304,6 +305,7 @@ async def main():
     async with httpx.AsyncClient(timeout=30.0) as client:
         asyncio.create_task(ws_manager.start(client))
         asyncio.create_task(trading_loop(client))
+        asyncio.create_task(bybit_feed.start())
         
         ui_queue = asyncio.Queue()
 

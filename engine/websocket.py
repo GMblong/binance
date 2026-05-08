@@ -7,6 +7,8 @@ from websockets.asyncio.client import connect
 from websockets.protocol import State
 from utils.state import bot_state, market_data
 from utils.logger import log_error
+from utils.intelligence import update_feature_weights
+from engine.ml_engine import ml_predictor
 import pandas as pd
 
 class WebSocketManager:
@@ -28,13 +30,24 @@ class WebSocketManager:
         """Dynamically update WS subscriptions based on scan list."""
         if not self.ws or self.ws.state != State.OPEN: return
         
-        # Desired streams: targeted ticker + 4 kline intervals for each symbol
+        # Desired streams: targeted ticker + 4 kline intervals for each symbol.
+        # @aggTrade is expensive (hundreds of msg/sec for BTC) so we limit it
+        # to the top-N coins where live CVD actually matters for entries.
+        # @depth@500ms for top-N coins for real-time orderflow microstructure.
+        AGG_TOP_N = 10
+        DEPTH_TOP_N = 10
+        agg_symbols = set(symbols[:AGG_TOP_N])
+        depth_symbols = set(symbols[:DEPTH_TOP_N])
         desired = set()
         for s in symbols:
             s_low = s.lower()
-            desired.add(f"{s_low}@ticker") # Targeted ticker instead of global array
+            desired.add(f"{s_low}@ticker")
             for interval in ["1m", "5m", "15m", "1h"]:
                 desired.add(f"{s_low}@kline_{interval}")
+            if s in agg_symbols:
+                desired.add(f"{s_low}@aggTrade")
+            if s in depth_symbols:
+                desired.add(f"{s_low}@depth@500ms")
         
         to_subscribe = list(desired - self.active_streams)
         to_unsubscribe = list(self.active_streams - desired)
@@ -167,14 +180,17 @@ class WebSocketManager:
                                             bot_state["last_log"] = f"[bold green]WS: {sym} Filled at {o['L']}[/]"
                                             
                                             # Avoid double counting W/L for the same order
-                                            if not hasattr(self, '_processed_orders'): self._processed_orders = set()
+                                            if not hasattr(self, '_processed_orders'):
+                                                from collections import deque as _deque
+                                                self._processed_orders = _deque(maxlen=200)
                                             if oid not in self._processed_orders:
                                                 rp = float(o.get("rp", 0))
-                                                # If rp is 0 on the final fill, it might have been in partials, 
-                                                # but for simplicity we count it if non-zero.
-                                                if rp != 0:
-                                                    self._processed_orders.add(oid)
-                                                    if len(self._processed_orders) > 200: self._processed_orders.pop() # Keep it small
+                                                # Skip if already counted by close_position_async
+                                                recently_closed = bot_state.get("_recently_closed", {})
+                                                already_counted = sym in recently_closed and (time.time() - recently_closed[sym]) < 10
+                                                
+                                                if rp != 0 and not already_counted:
+                                                    self._processed_orders.append(oid)
                                                     
                                                     if rp > 0:
                                                         ml_predictor.update_performance(sym, True)
@@ -189,6 +205,18 @@ class WebSocketManager:
                                                         bot_state["sym_perf"][sym]['l'] += 1
                                                         bot_state["sym_perf"][sym]['c'] += 1
                                                         bot_state["sym_perf"][sym]['last_loss_time'] = time.time()
+
+                                                    # Feature-level feedback (only if we still have the entry snapshot)
+                                                    trade_meta = bot_state.get("trades", {}).get(sym, {})
+                                                    active_feats = trade_meta.get("active_features") or []
+                                                    if active_feats:
+                                                        update_feature_weights(active_feats, rp > 0)
+                                                    # Clean stale trade snapshot so we don't double-credit
+                                                    if sym in bot_state.get("trades", {}):
+                                                        del bot_state["trades"][sym]
+                                                elif rp != 0 and already_counted:
+                                                    # Clean up the recently_closed marker
+                                                    recently_closed.pop(sym, None)
 
                                 # 2. Market Data
                                 elif "@ticker" in stream_name:
@@ -210,6 +238,33 @@ class WebSocketManager:
                                         "l": float(k['l']), "c": float(k['c']),
                                         "v": float(k['v']), "tbv": float(k['V'])
                                     })
+                                elif "@aggTrade" in stream_name:
+                                    # Binance aggTrade payload: s=symbol, p=price, q=qty, m=isBuyerMaker, T=trade_time_ms
+                                    try:
+                                        sym_a = data['s']
+                                        price_a = float(data['p'])
+                                        qty_a = float(data['q'])
+                                        is_bm = bool(data.get('m', False))
+                                        ts_a = float(data.get('T', time.time() * 1000)) / 1000.0
+                                        market_data.push_agg_trade(sym_a, ts_a, qty_a, price_a, is_bm)
+                                    except Exception:
+                                        pass
+                                elif "@depth" in stream_name:
+                                    # Binance depth stream: b=bids[[price,qty],...], a=asks[[price,qty],...]
+                                    try:
+                                        sym_d = stream_name.split("@")[0].upper()
+                                        bids = data.get('b', [])
+                                        asks = data.get('a', [])
+                                        bid_total = sum(float(b[1]) for b in bids[:10])
+                                        ask_total = sum(float(a[1]) for a in asks[:10])
+                                        top_bid_qty = float(bids[0][1]) if bids else 0
+                                        top_ask_qty = float(asks[0][1]) if asks else 0
+                                        # Update imbalance + depth microstructure
+                                        if ask_total > 0:
+                                            market_data.imbalance[sym_d] = bid_total / ask_total
+                                        market_data.push_depth_snapshot(sym_d, bid_total, ask_total, top_bid_qty, top_ask_qty)
+                                    except Exception:
+                                        pass
 
                             if self.msg_count % 100 == 0:
                                 bot_state["last_log"] = f"[bold green]WS Live: {self.msg_count} pkts | {len(self.active_streams)} streams[/]"

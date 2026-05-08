@@ -1,42 +1,22 @@
 """
-Pro Backtester
---------------
-Replays historical 1m klines tick-by-tick with strict, trader-realistic
-execution semantics. Designed to give an HONEST estimate of expected PnL.
+Pro Backtester (sinkron dengan strategi LIVE)
+=============================================
+Replika logika entry & exit dari `strategies/hybrid.py` + `strategies/analyzer.py`
++ `engine/ml_engine.py` — tanpa async, tanpa dependency ke httpx/websocket.
+Gunanya: memvalidasi strategi bot live pada data historis.
 
-Improvements over backtest_today.py / backtest_yesterday.py:
+Jalanin:
+    python backtest_pro.py                                  # default: BTC/ETH/SOL/BNB/XRP, 3 hari
+    python backtest_pro.py --symbols BTCUSDT,ETHUSDT --days 5
+    python backtest_pro.py --offline                        # data sintetik GBM (kalau API tak bisa)
 
-  * NO look-ahead.   Signals are generated at candle close[t]; SL/TP/partial
-    exits are evaluated using candles [t+1, t+2, ...]. Pending limit orders
-    are checked AFTER the signal candle, never on the signal bar.
-  * Realistic fills. Market orders pay a configurable spread + slippage on
-    entry and on every exit; taker fees are charged on both sides.
-  * Partial exits. 60% of size closes at TP1 (R=1); remainder runs to TP2
-    with the stop moved to break-even. This mirrors how professional
-    scalpers actually manage risk.
-  * Per-symbol daily loss kill-switch, cooldown after consecutive losses,
-    and portfolio-level drawdown guard.
-  * Deterministic walk-forward: the ML model is trained on the first half
-    of the series and evaluated on the second half only, preventing
-    label leakage.
-  * Synthetic-data fallback (--offline): generates GBM-style 1m candles
-    with regime shifts when Binance API is unreachable, so the strategy
-    can still be validated end-to-end.
-
-Run:
-    python backtest_pro.py                  # live klines from Binance
-    python backtest_pro.py --offline        # synthetic data
-    python backtest_pro.py --symbols BTCUSDT,ETHUSDT --days 3
-
-Produces a per-symbol and portfolio-level summary with win rate, expectancy,
-max drawdown, Sharpe, and profit factor.
+Output: win rate, expectancy, profit factor, max drawdown, Sharpe, per-setup breakdown.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import math
-import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -50,30 +30,374 @@ try:
 except Exception:
     _HAS_HTTPX = False
 
-from strategies.scalper_pro import (
-    ScalperPro, Features, build_features, fractional_kelly_risk, position_notional,
-)
-from engine.ml_engine_v2 import ml_v2
+try:
+    import lightgbm as lgb
+    from sklearn.model_selection import train_test_split
+    _HAS_LGBM = True
+except Exception:
+    _HAS_LGBM = False
+
+from strategies.analyzer import MarketAnalyzer
 
 
 API_URL = "https://fapi.binance.com"
 
-# ---------- Cost model ----------
-
+# Cost model (matching live trading realistic fills)
 TAKER_FEE = 0.0004            # 0.04% per side
-SPREAD_BPS = 0.5              # 0.5 bps half-spread baseline
-SLIPPAGE_ATR_FRAC = 0.05      # 5% of 1m ATR of adverse slippage on market orders
+SPREAD_BPS = 0.5              # 0.5 bps baseline
+SLIPPAGE_ATR_FRAC = 0.05      # 5% dari ATR 1m sebagai slippage untuk MARKET
+
+# ---------------------------------------------------------------------------
+# ML engine (sync clone dari engine/ml_engine.py, tanpa httpx)
+# ---------------------------------------------------------------------------
+
+_FEATURES = [
+    "ema_9", "ema_21", "rsi", "atr",
+    "roc_c_1", "roc_c_5", "roc_v_1",
+    "volatility", "body_size", "upper_wick", "lower_wick",
+    "dist_ema9", "dist_ema21", "dist_vwap", "cvd_roc",
+    "MACD_12_26_9", "MACDs_12_26_9", "MACDh_12_26_9",
+]
 
 
-# ---------- Data loading ----------
+def _ema(s: pd.Series, length: int) -> pd.Series:
+    return s.ewm(span=length, adjust=False).mean()
 
-async def fetch_klines(client, symbol: str, interval: str,
-                        limit: int = 1500, end_time: Optional[int] = None) -> Optional[pd.DataFrame]:
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    if end_time:
-        params["endTime"] = end_time
+
+def _rsi(s: pd.Series, length: int = 14) -> pd.Series:
+    delta = s.diff()
+    gain = delta.clip(lower=0).rolling(length).mean()
+    loss = (-delta.clip(upper=0)).rolling(length).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
+
+
+def _atr_series(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    h, l, c = df["h"], df["l"], df["c"]
+    tr = pd.concat([(h - l).abs(), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(length).mean()
+
+
+def build_ml_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Feature engineering — sama dengan `MLPredictor.feature_engineering` tapi sync."""
+    df = df.copy()
+    df["ema_9"] = _ema(df["c"], 9)
+    df["ema_21"] = _ema(df["c"], 21)
+    df["rsi"] = _rsi(df["c"], 14)
+    df["atr"] = _atr_series(df, 14)
+
+    e12 = df["c"].ewm(span=12, adjust=False).mean()
+    e26 = df["c"].ewm(span=26, adjust=False).mean()
+    df["MACD_12_26_9"] = e12 - e26
+    df["MACDs_12_26_9"] = df["MACD_12_26_9"].ewm(span=9, adjust=False).mean()
+    df["MACDh_12_26_9"] = df["MACD_12_26_9"] - df["MACDs_12_26_9"]
+
+    # VWAP
+    tp = (df["h"] + df["l"] + df["c"]) / 3
+    vp = tp * df["v"]
+    df["vwap"] = vp.rolling(100).sum() / df["v"].rolling(100).sum()
+    df["dist_vwap"] = (df["c"] - df["vwap"]) / df["vwap"]
+
+    # CVD proxy
+    rng = (df["h"] - df["l"]).replace(0, np.nan) + 1e-9
+    buy_vol = df["v"] * ((df["c"] - df["l"]) / rng)
+    sell_vol = df["v"] * ((df["h"] - df["c"]) / rng)
+    cvd = (buy_vol - sell_vol).cumsum()
+    df["cvd_roc"] = cvd.pct_change(3).fillna(0)
+
+    df["roc_c_1"] = df["c"].pct_change(1)
+    df["roc_c_5"] = df["c"].pct_change(5)
+    df["roc_v_1"] = df["v"].pct_change(1)
+    df["volatility"] = (df["h"] - df["l"]) / df["c"]
+    df["body_size"] = (df["c"] - df["o"]).abs() / df["c"]
+    df["upper_wick"] = (df["h"] - df[["o", "c"]].max(axis=1)) / df["c"]
+    df["lower_wick"] = (df[["o", "c"]].min(axis=1) - df["l"]) / df["c"]
+
+    df["dist_ema9"] = (df["c"] - df["ema_9"]) / df["ema_9"]
+    df["dist_ema21"] = (df["c"] - df["ema_21"]) / df["ema_21"]
+
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    return df
+
+
+def triple_barrier_labels(df: pd.DataFrame, pt_mult: float = 1.5, sl_mult: float = 1.2, lookahead: int = 15) -> pd.Series:
+    """Label 1 kalau TP hit duluan, 0 kalau SL hit/timeout."""
+    prices = df["c"].values
+    highs = df["h"].values
+    lows = df["l"].values
+    atrs = df["atr"].values
+    median_atr = df["atr"].rolling(100).median().bfill().values
+
+    labels = np.full(len(df), np.nan)
+    for i in range(len(df) - lookahead):
+        entry = prices[i]
+        cur_atr = atrs[i]
+        base_atr = median_atr[i]
+        if not math.isfinite(cur_atr) or cur_atr <= 0 or not math.isfinite(base_atr):
+            continue
+        vol_ratio = cur_atr / (base_atr + 1e-9)
+        dyn_pt = pt_mult * min(max(vol_ratio, 0.8), 2.0)
+        dyn_sl = sl_mult * min(max(vol_ratio, 0.8), 2.0)
+        pt_price = entry + cur_atr * dyn_pt
+        sl_price = entry - cur_atr * dyn_sl
+        lbl = 0
+        for j in range(1, lookahead + 1):
+            if highs[i + j] >= pt_price:
+                lbl = 1
+                break
+            if lows[i + j] <= sl_price:
+                lbl = 0
+                break
+        labels[i] = lbl
+    return pd.Series(labels, index=df.index)
+
+
+class SyncMLPredictor:
+    """Versi sync dari `MLPredictor`. Dilatih sekali di awal backtest per simbol."""
+
+    def __init__(self):
+        self.models: Dict[str, object] = {}
+
+    def train(self, symbol: str, df_1m: pd.DataFrame) -> bool:
+        if not _HAS_LGBM or len(df_1m) < 300:
+            return False
+        feats = build_ml_features(df_1m)
+        feats["target"] = triple_barrier_labels(feats, pt_mult=1.5, sl_mult=1.2, lookahead=15)
+        feats = feats.dropna(subset=_FEATURES + ["target"])
+        if len(feats) < 120:
+            return False
+        X = feats[_FEATURES]
+        y = feats["target"].astype(int)
+        if y.nunique() < 2:
+            return False
+        X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, shuffle=False)
+        model = lgb.LGBMClassifier(
+            n_estimators=120, learning_rate=0.06, max_depth=5, num_leaves=20,
+            subsample=0.8, colsample_bytree=0.8, random_state=42,
+            class_weight="balanced", n_jobs=-1, verbose=-1,
+        )
+        model.fit(X_tr, y_tr)
+        acc = (model.predict(X_te) == y_te).mean()
+        if acc < 0.50:
+            return False
+        self.models[symbol] = model
+        return True
+
+    def predict(self, symbol: str, df_1m: pd.DataFrame) -> float:
+        model = self.models.get(symbol)
+        if model is None:
+            return 0.5
+        feats = build_ml_features(df_1m.tail(120))
+        feats = feats.dropna(subset=_FEATURES)
+        if feats.empty:
+            return 0.5
+        X = feats[_FEATURES].iloc[[-1]]
+        try:
+            return float(model.predict_proba(X)[0][1])
+        except Exception:
+            return 0.5
+
+
+# ---------------------------------------------------------------------------
+# Signal generator (sync clone dari `analyze_hybrid_async`)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Signal:
+    side: str          # "LONG" / "SHORT"
+    score: int
+    regime: str
+    setup: str         # label untuk breakdown report
+    entry_hint: float  # harga limit rekomendasi (fallback = close)
+    sl_pct: float
+    tp_pct: float
+    ml_prob: float
+    is_market: bool
+
+
+def analyze_sync(
+    d1m: pd.DataFrame,
+    d15m: pd.DataFrame,
+    d1h: pd.DataFrame,
+    ml_prob: float,
+    imbalance: float = 1.0,
+    funding: float = 0.0,
+) -> Optional[Signal]:
+    """Ekuivalen sinkron dari `strategies.hybrid.analyze_hybrid_async`.
+
+    Catatan: fitur live-only (lead-lag BTC, session heuristic) disederhanakan.
+    Fokusnya mereplika *entry gate* + *score* + *SL/TP sizing* supaya backtest
+    mencerminkan strategi nyata.
+    """
+    if len(d1m) < 60 or len(d15m) < 30 or len(d1h) < 20:
+        return None
+
     try:
-        r = await client.get(f"{API_URL}/fapi/v1/klines", params=params, timeout=20)
+        price = float(d1m["c"].iloc[-1])
+
+        # --- Direction (ADX-gated EMA cross, RSI mean-rev fallback) ---
+        ema9_15m = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
+        ema21_15m = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
+        adx_val = MarketAnalyzer.get_adx(d15m, 14)
+        if adx_val > 20:
+            direction = 1 if ema9_15m > ema21_15m else -1
+        else:
+            rsi_15m = MarketAnalyzer.get_rsi(d15m["c"], 14).iloc[-1]
+            if rsi_15m < 35:
+                direction = 1
+            elif rsi_15m > 65:
+                direction = -1
+            else:
+                direction = 1 if ema9_15m > ema21_15m else -1
+
+        # --- HTF alignment (1h) ---
+        ema50_1h = MarketAnalyzer.get_ema(d1h["c"], 50).iloc[-1] if len(d1h) >= 50 else d1h["c"].iloc[-1]
+        htf_dir = 1 if d1h["c"].iloc[-1] > ema50_1h else -1
+        mtf_aligned = (direction == htf_dir)
+
+        atr = MarketAnalyzer.get_atr(d1m, 14).iloc[-1]
+        if not math.isfinite(atr) or atr <= 0:
+            return None
+        base_atr_pct = (atr / price) * 100
+
+        regime = MarketAnalyzer.detect_regime(d15m)
+
+        # --- Score (hybrid live logic) ---
+        score = MarketAnalyzer.calculate_score(
+            d1m, d15m, direction, imbalance=imbalance, funding=funding,
+            regime=regime, neural_weights=None, session="QUIET", lead_lag=0,
+        )
+        if not mtf_aligned:
+            score = int(score * 0.6)
+
+        # --- ML blending (matching hybrid.py) ---
+        if direction == 1:
+            if ml_prob >= 0.65:
+                score += int((ml_prob - 0.6) * 50)
+            elif ml_prob < 0.40:
+                score += int((ml_prob - 0.4) * 50)
+        else:
+            if ml_prob <= 0.35:
+                score += int((0.4 - ml_prob) * 50)
+            elif ml_prob > 0.60:
+                score += int((0.6 - ml_prob) * 50)
+        score = max(0, min(score, 100))
+
+        # --- Liquidation magnet bonus ---
+        liq = MarketAnalyzer.predict_liquidation_clusters(d15m)
+        if liq:
+            if direction == 1 and any(p > price for p in liq["short_liq"]):
+                score = min(score + 5, 100)
+            elif direction == -1 and any(p < price for p in liq["long_liq"]):
+                score = min(score + 5, 100)
+
+        # --- Fake move / overextended rejection ---
+        vol_avg = d1m["v"].tail(20).mean()
+        vol_recent = d1m["v"].tail(3).mean()
+        vol_confirmed = vol_recent > vol_avg * 1.2
+        last = d1m.iloc[-1]
+        rng = float(last["h"] - last["l"])
+        body = abs(float(last["c"] - last["o"]))
+        body_ratio = body / rng if rng > 0 else 0
+        is_fake = (not vol_confirmed) and body_ratio < 0.3
+
+        ema21_1m = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
+        dist_ema = abs(price - ema21_1m) / price * 100
+        is_over = dist_ema > base_atr_pct * 2.5
+
+        # --- SL (structure-based with ML modulation) ---
+        buffer_pct = max(base_atr_pct * 0.3, 0.12)
+        low_L1 = d1m["l"].tail(15).min()
+        low_L2 = d1m["l"].tail(30).min()
+        high_L1 = d1m["h"].tail(15).max()
+        high_L2 = d1m["h"].tail(30).max()
+        ob = MarketAnalyzer.find_nearest_order_block(d1m, price, direction)
+        if direction == 1:
+            struct_low = low_L2 if ((price - low_L2) / price * 100) <= 3.0 else low_L1
+            sl_price = ob["bottom"] if ob else (struct_low if struct_low else price * 0.99)
+            sl_pct = ((price - sl_price) / price * 100) + buffer_pct
+        else:
+            struct_high = high_L2 if ((high_L2 - price) / price * 100) <= 3.0 else high_L1
+            sl_price = ob["top"] if ob else (struct_high if struct_high else price * 1.01)
+            sl_pct = ((sl_price - price) / price * 100) + buffer_pct
+        if ml_prob > 0.7 or ml_prob < 0.3:
+            sl_pct *= 0.85
+        elif 0.45 < ml_prob < 0.55:
+            sl_pct *= 1.15
+        sl_pct = max(0.4, min(sl_pct, 3.5))
+
+        # --- TP (regime + liq magnet) ---
+        rr_mult = 2.0
+        if regime == "RANGING":
+            rr_mult = 1.5
+        elif regime == "TRENDING":
+            rr_mult = 2.5 if ((direction == 1 and ml_prob > 0.65) or (direction == -1 and ml_prob < 0.35)) else 2.0
+        elif regime == "VOLATILE":
+            rr_mult = 1.8
+
+        htf_high = d15m["h"].tail(20).max() if len(d15m) >= 20 else high_L2
+        htf_low = d15m["l"].tail(20).min() if len(d15m) >= 20 else low_L2
+        tp_pct = sl_pct * rr_mult
+        if direction == 1:
+            struct_dist = ((htf_high - price) / price) * 100
+            if struct_dist > sl_pct * 1.2:
+                tp_pct = min(max(tp_pct, struct_dist), sl_pct * 3.5)
+            if liq and any(p > price for p in liq.get("short_liq", [])):
+                liq_target = min(p for p in liq["short_liq"] if p > price)
+                liq_dist = ((liq_target - price) / price) * 100
+                if liq_dist > tp_pct and liq_dist < sl_pct * 4:
+                    tp_pct = liq_dist
+        else:
+            struct_dist = ((price - htf_low) / price) * 100
+            if struct_dist > sl_pct * 1.2:
+                tp_pct = min(max(tp_pct, struct_dist), sl_pct * 3.5)
+            if liq and any(p < price for p in liq.get("long_liq", [])):
+                liq_target = max(p for p in liq["long_liq"] if p < price)
+                liq_dist = ((price - liq_target) / price) * 100
+                if liq_dist > tp_pct and liq_dist < sl_pct * 4:
+                    tp_pct = liq_dist
+        tp_pct = max(sl_pct * 1.3, tp_pct)
+
+        # --- Threshold & breakout ---
+        prev_15_high = d1m["h"].iloc[-16:-1].max()
+        prev_15_low = d1m["l"].iloc[-16:-1].min()
+        raw_breakout = (direction == 1 and price > prev_15_high) or (direction == -1 and price < prev_15_low)
+        is_breakout = raw_breakout and vol_confirmed and body_ratio > 0.5
+
+        threshold = 80
+        if regime == "VOLATILE":
+            threshold = 75 if is_breakout else 90
+        elif regime == "RANGING":
+            threshold = 88
+        elif regime == "TRENDING":
+            threshold = 75 if is_breakout else 82
+
+        is_market = regime == "TRENDING" and is_breakout and score >= 90 and not is_fake
+
+        if is_fake or is_over:
+            return None
+        if score < threshold:
+            return None
+
+        side = "LONG" if direction == 1 else "SHORT"
+        setup = f"{regime}-{'BRK' if is_breakout else 'PULL'}"
+        return Signal(
+            side=side, score=int(score), regime=regime, setup=setup,
+            entry_hint=float(price), sl_pct=float(sl_pct), tp_pct=float(tp_pct),
+            ml_prob=float(ml_prob), is_market=bool(is_market),
+        )
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+async def fetch_klines(client, symbol: str, interval: str, limit: int = 1500) -> Optional[pd.DataFrame]:
+    try:
+        r = await client.get(f"{API_URL}/fapi/v1/klines",
+                             params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=20)
     except Exception:
         return None
     if r.status_code != 200:
@@ -81,66 +405,47 @@ async def fetch_klines(client, symbol: str, interval: str,
     raw = r.json()
     if not raw:
         return None
-    df = pd.DataFrame(raw).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
-    df.columns = ["ot", "o", "h", "l", "c", "v", "tbv"]
+    df = pd.DataFrame(raw).iloc[:, [0, 1, 2, 3, 4, 5]]
+    df.columns = ["ot", "o", "h", "l", "c", "v"]
     return df.astype(float).reset_index(drop=True)
 
 
-def synth_klines(n: int, seed: int, start_price: float = 30000.0,
-                 drift_phases: int = 4) -> pd.DataFrame:
-    """Generate 1m klines with alternating trend/range/vol regimes.
-
-    Not a substitute for real data, but useful for offline validation of the
-    backtester pipeline and sanity checks."""
+def synth_klines(n: int, seed: int, start_price: float = 30000.0, phases: int = 4) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
-    phase_len = n // drift_phases
-    mu_choices = [0.00005, -0.00005, 0.0, 0.00015, -0.00015]
-    sigma_choices = [0.0006, 0.0012, 0.0020]
-
+    phase_len = n // phases
+    mu_pool = [0.00005, -0.00005, 0.0, 0.00015, -0.00015]
+    sg_pool = [0.0006, 0.0012, 0.0020]
     prices = [start_price]
-    for p in range(drift_phases):
-        mu = rng.choice(mu_choices)
-        sigma = rng.choice(sigma_choices)
+    for _ in range(phases):
+        mu = rng.choice(mu_pool); sg = rng.choice(sg_pool)
         for _ in range(phase_len):
-            ret = rng.normal(mu, sigma)
-            prices.append(max(prices[-1] * (1 + ret), 1e-6))
-
+            prices.append(max(prices[-1] * (1 + rng.normal(mu, sg)), 1e-6))
     close = np.array(prices[1:])
-    # Intra-bar wicks: random range around close
     wick = np.abs(rng.normal(0, close.std() / close.mean() * 0.3, size=len(close)))
-    high = close * (1 + wick * 0.5)
-    low = close * (1 - wick * 0.5)
+    high = close * (1 + wick * 0.5); low = close * (1 - wick * 0.5)
     open_ = np.concatenate([[start_price], close[:-1]])
-    # High/low envelope
     high = np.maximum.reduce([high, open_, close])
     low = np.minimum.reduce([low, open_, close])
-
-    # Volume correlated with |return|
     ret = np.concatenate([[0.0], np.diff(close) / close[:-1]])
-    base_vol = 500 + np.abs(ret) * 300000
-    v = base_vol * (1 + rng.normal(0, 0.2, size=len(close))).clip(0.1)
-    tbv = v * (0.5 + np.sign(ret) * np.abs(ret) * 50).clip(0.1, 0.9)
-
+    v = (500 + np.abs(ret) * 300000) * (1 + rng.normal(0, 0.2, size=len(close))).clip(0.1)
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     ot = now_ms - (len(close) - np.arange(len(close))) * 60_000
-    df = pd.DataFrame({"ot": ot, "o": open_, "h": high, "l": low, "c": close, "v": v, "tbv": tbv})
-    return df.reset_index(drop=True)
+    return pd.DataFrame({"ot": ot, "o": open_, "h": high, "l": low, "c": close, "v": v}).reset_index(drop=True)
 
 
 def resample(df_1m: pd.DataFrame, minutes: int) -> pd.DataFrame:
-    """Resample 1m dataframe to higher timeframe using ot (ms)."""
     df = df_1m.copy()
     df["dt"] = pd.to_datetime(df["ot"], unit="ms")
     df.set_index("dt", inplace=True)
-    rule = f"{minutes}min"
-    agg = df.resample(rule, label="right", closed="right").agg(
-        {"ot": "first", "o": "first", "h": "max", "l": "min", "c": "last",
-         "v": "sum", "tbv": "sum"}
+    agg = df.resample(f"{minutes}min", label="right", closed="right").agg(
+        {"ot": "first", "o": "first", "h": "max", "l": "min", "c": "last", "v": "sum"}
     ).dropna()
     return agg.reset_index(drop=True)
 
 
-# ---------- Execution engine ----------
+# ---------------------------------------------------------------------------
+# Execution engine
+# ---------------------------------------------------------------------------
 
 @dataclass
 class Position:
@@ -152,24 +457,18 @@ class Position:
     tp1: float
     tp2: float
     opened_at: int
+    r_unit: float
+    setup: str
     partial_taken: bool = False
-    remaining_frac: float = 1.0
-    r_unit: float = 0.0
-    setup: str = ""
+    peak: float = 0.0
 
 
 @dataclass
 class ClosedTrade:
-    symbol: str
-    side: str
-    setup: str
-    opened_at: int
-    closed_at: int
-    pnl_usd: float
-    reason: str
-    entry: float
-    exit: float
-    bars_held: int
+    symbol: str; side: str; setup: str
+    opened_at: int; closed_at: int
+    pnl_usd: float; reason: str
+    entry: float; exit: float; bars_held: int
 
 
 @dataclass
@@ -182,134 +481,139 @@ class AccountState:
     trades: List[ClosedTrade] = field(default_factory=list)
 
 
-def _apply_slippage(side: str, price: float, atr_1m: float, is_market: bool) -> float:
-    """Return fill price after slippage for MARKET orders."""
+def _slip(side: str, price: float, atr_1m: float, is_market: bool) -> float:
     if not is_market:
         return price
-    slip = SLIPPAGE_ATR_FRAC * atr_1m + price * SPREAD_BPS / 10000
-    return price + slip if side == "LONG" else price - slip
+    s = SLIPPAGE_ATR_FRAC * atr_1m + price * SPREAD_BPS / 10000
+    return price + s if side == "LONG" else price - s
 
 
-def _close_position(pos: Position, exit_price: float, reason: str,
-                    bar_idx: int) -> ClosedTrade:
+def _close(pos: Position, exit_price: float, reason: str, bar_idx: int) -> ClosedTrade:
     if pos.side == "LONG":
-        pnl_pct = (exit_price - pos.entry) / pos.entry
+        pct = (exit_price - pos.entry) / pos.entry
     else:
-        pnl_pct = (pos.entry - exit_price) / pos.entry
-    gross = pnl_pct * pos.size_usd
-    # Taker fees on both sides of the portion being closed
+        pct = (pos.entry - exit_price) / pos.entry
+    gross = pct * pos.size_usd
     fee = 2 * TAKER_FEE * pos.size_usd
-    return ClosedTrade(
-        symbol=pos.symbol, side=pos.side, setup=pos.setup,
-        opened_at=pos.opened_at, closed_at=bar_idx,
-        pnl_usd=gross - fee, reason=reason,
-        entry=pos.entry, exit=exit_price, bars_held=bar_idx - pos.opened_at,
-    )
+    return ClosedTrade(pos.symbol, pos.side, pos.setup, pos.opened_at, bar_idx,
+                       gross - fee, reason, pos.entry, exit_price, bar_idx - pos.opened_at)
 
-
-# ---------- Backtest loop ----------
 
 @dataclass
 class BacktestConfig:
     symbols: List[str]
-    days: int = 1
+    days: int = 3
     starting_balance: float = 100.0
-    risk_pct: float = 0.01          # 1% base risk; Kelly adjusts within 0.25x-1.5x
-    max_positions: int = 2
+    risk_pct: float = 0.01
+    max_positions: int = 3
     max_consec_losses: int = 3
-    cooldown_bars: int = 60         # 60 min cooldown after 3 losses in a row
-    daily_loss_limit_pct: float = 0.04
+    cooldown_bars: int = 60
+    daily_loss_limit_pct: float = 0.05
     offline: bool = False
-    train_frac: float = 0.5         # use first 50% for ML training
-    ml_min_prob: float = 0.55
+    ml_min_prob: float = 0.50
+    train_frac: float = 0.5
+    partial_pct: float = 0.5          # 50% close di TP1 (RR 1:1)
 
 
 class ProBacktester:
     def __init__(self, cfg: BacktestConfig):
         self.cfg = cfg
-        self.strategy = ScalperPro()
+        self.ml = SyncMLPredictor()
 
-    async def _load_symbol(self, client, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
+    async def _load(self, client, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
         if self.cfg.offline:
             seed = abs(hash(symbol)) % (2**31)
-            # 1m history: `days * 1440` + 500 warm-up candles
             n = self.cfg.days * 1440 + 500
-            df_1m = synth_klines(n, seed=seed, start_price=1000.0 * (1 + (seed % 50) / 50))
+            df1 = synth_klines(n, seed=seed, start_price=1000.0 * (1 + (seed % 50) / 50))
         else:
-            df_1m = await fetch_klines(client, symbol, "1m", limit=min(1500, self.cfg.days * 1440 + 500))
-        if df_1m is None or len(df_1m) < 500:
+            # Binance max limit per req = 1500; paginate backward until we have enough
+            need = self.cfg.days * 1440 + 500
+            frames: List[pd.DataFrame] = []
+            end_time: Optional[int] = None
+            while sum(len(f) for f in frames) < need:
+                batch = 1500
+                params = {"symbol": symbol, "interval": "1m", "limit": batch}
+                if end_time:
+                    params["endTime"] = end_time
+                try:
+                    r = await client.get(f"{API_URL}/fapi/v1/klines", params=params, timeout=20)
+                except Exception:
+                    break
+                if r.status_code != 200:
+                    break
+                raw = r.json()
+                if not raw:
+                    break
+                df = pd.DataFrame(raw).iloc[:, [0, 1, 2, 3, 4, 5]]
+                df.columns = ["ot", "o", "h", "l", "c", "v"]
+                df = df.astype(float)
+                frames.append(df)
+                end_time = int(df["ot"].iloc[0]) - 1
+                if len(raw) < batch:
+                    break
+            if not frames:
+                return None
+            df1 = pd.concat(frames[::-1], ignore_index=True).drop_duplicates(subset="ot").sort_values("ot").reset_index(drop=True)
+        if df1 is None or len(df1) < 500:
             return None
-        df_5m = resample(df_1m, 5)
-        df_15m = resample(df_1m, 15)
-        df_1h = resample(df_1m, 60)
-        return {"1m": df_1m, "5m": df_5m, "15m": df_15m, "1h": df_1h}
+        return {"1m": df1, "15m": resample(df1, 15), "1h": resample(df1, 60)}
 
-    def _warmup_and_train(self, data: Dict[str, pd.DataFrame], symbol: str) -> int:
-        """Train ML on the training portion only; return the index in 1m where
-        out-of-sample testing begins. Also acts as the start-of-simulation bar."""
-        df1 = data["1m"]
+    def _train_split_idx(self, df1: pd.DataFrame) -> int:
         train_end = int(len(df1) * self.cfg.train_frac)
-        # Need at least 300 bars of warmup in-sample for indicator stability
-        start_bar = max(train_end, 300)
-        try:
-            ml_v2.train(df1.iloc[:train_end].copy(), symbol)
-        except Exception:
-            pass
-        return start_bar
+        return max(train_end, 300)
 
-    def _align_htf(self, df_htf: pd.DataFrame, ts_ms: int) -> pd.DataFrame:
-        """Slice HTF dataframe to rows with ot <= ts_ms (no future leakage)."""
-        return df_htf[df_htf["ot"] <= ts_ms]
+    def _htf_slice(self, htf: pd.DataFrame, ts_ms: int) -> pd.DataFrame:
+        return htf[htf["ot"] <= ts_ms]
 
-    def _check_position(self, pos: Position, bar: pd.Series, bar_idx: int) -> Tuple[Optional[ClosedTrade], Optional[ClosedTrade]]:
-        """Update position for this bar, returning (partial_close, full_close) if any."""
-        # Partial take at TP1
+    def _check_position(self, pos: Position, bar: pd.Series, bar_idx: int
+                        ) -> Tuple[Optional[ClosedTrade], Optional[ClosedTrade]]:
         partial: Optional[ClosedTrade] = None
         if not pos.partial_taken:
-            hit = (pos.side == "LONG" and bar["h"] >= pos.tp1) or \
-                  (pos.side == "SHORT" and bar["l"] <= pos.tp1)
-            if hit:
-                partial_size = pos.size_usd * self.strategy.PARTIAL_PCT
-                part_pos = Position(
-                    symbol=pos.symbol, side=pos.side, entry=pos.entry,
-                    size_usd=partial_size, sl=pos.sl, tp1=pos.tp1, tp2=pos.tp2,
-                    opened_at=pos.opened_at, r_unit=pos.r_unit, setup=pos.setup,
-                )
-                partial = _close_position(part_pos, pos.tp1, "TP1", bar_idx)
-                pos.size_usd *= (1 - self.strategy.PARTIAL_PCT)
+            hit_tp1 = (pos.side == "LONG" and bar["h"] >= pos.tp1) or \
+                      (pos.side == "SHORT" and bar["l"] <= pos.tp1)
+            if hit_tp1:
+                size_part = pos.size_usd * self.cfg.partial_pct
+                part_pos = Position(pos.symbol, pos.side, pos.entry, size_part,
+                                    pos.sl, pos.tp1, pos.tp2, pos.opened_at,
+                                    pos.r_unit, pos.setup)
+                partial = _close(part_pos, pos.tp1, "TP1", bar_idx)
+                pos.size_usd *= (1 - self.cfg.partial_pct)
                 pos.partial_taken = True
-                pos.sl = pos.entry  # move stop to break-even on the runner
+                pos.sl = pos.entry  # breakeven
 
-        # Full exit at SL or TP2
         full: Optional[ClosedTrade] = None
         if pos.side == "LONG":
             if bar["l"] <= pos.sl:
-                full = _close_position(pos, pos.sl, "SL" if not pos.partial_taken else "BE", bar_idx)
+                reason = "BE" if pos.partial_taken else "SL"
+                full = _close(pos, pos.sl, reason, bar_idx)
             elif bar["h"] >= pos.tp2:
-                full = _close_position(pos, pos.tp2, "TP2", bar_idx)
+                full = _close(pos, pos.tp2, "TP2", bar_idx)
         else:
             if bar["h"] >= pos.sl:
-                full = _close_position(pos, pos.sl, "SL" if not pos.partial_taken else "BE", bar_idx)
+                reason = "BE" if pos.partial_taken else "SL"
+                full = _close(pos, pos.sl, reason, bar_idx)
             elif bar["l"] <= pos.tp2:
-                full = _close_position(pos, pos.tp2, "TP2", bar_idx)
+                full = _close(pos, pos.tp2, "TP2", bar_idx)
         return partial, full
 
-    def _run_single(self, symbol: str, data: Dict[str, pd.DataFrame], acct: AccountState) -> None:
+    def _run_symbol(self, symbol: str, data: Dict[str, pd.DataFrame], acct: AccountState) -> int:
         df1 = data["1m"]
-        start = self._warmup_and_train(data, symbol)
+        d15 = data["15m"]
+        d1h = data["1h"]
+
+        # Train ML on first half only (walk-forward)
+        train_end = int(len(df1) * self.cfg.train_frac)
+        trained = self.ml.train(symbol, df1.iloc[:train_end].copy())
+
+        start = max(train_end, 300)
         positions: List[Position] = []
+        sym_trades = 0
 
-        # Stats for dynamic Kelly sizing (scoped per symbol)
-        rolling_win_rate = 0.5
-        rolling_rr = 1.3
-        win_window: List[int] = []
-
-        # Walk forward, bar-by-bar
         for i in range(start, len(df1) - 1):
             bar = df1.iloc[i]
             next_bar = df1.iloc[i + 1]
 
-            # 1) Update open positions against this bar (intra-bar order: SL worst case).
+            # Update open positions
             new_positions: List[Position] = []
             for pos in positions:
                 partial, full = self._check_position(pos, bar, i)
@@ -317,15 +621,13 @@ class ProBacktester:
                     acct.balance += partial.pnl_usd
                     acct.peak_balance = max(acct.peak_balance, acct.balance)
                     acct.trades.append(partial)
+                    sym_trades += 1
                 if full:
                     acct.balance += full.pnl_usd
                     acct.peak_balance = max(acct.peak_balance, acct.balance)
                     acct.trades.append(full)
-                    is_win = 1 if full.pnl_usd > 0 else 0
-                    win_window.append(is_win)
-                    if len(win_window) > 30:
-                        win_window.pop(0)
-                    rolling_win_rate = sum(win_window) / len(win_window)
+                    sym_trades += 1
+                    is_win = full.pnl_usd > 0
                     acct.consec_losses = 0 if is_win else acct.consec_losses + 1
                     if acct.consec_losses >= self.cfg.max_consec_losses:
                         acct.cooldown_until = i + self.cfg.cooldown_bars
@@ -334,7 +636,7 @@ class ProBacktester:
                     new_positions.append(pos)
             positions = new_positions
 
-            # 2) Guard rails before generating new entries
+            # Guards
             if i < acct.cooldown_until:
                 continue
             if acct.balance <= acct.day_start_balance * (1 - self.cfg.daily_loss_limit_pct):
@@ -342,55 +644,67 @@ class ProBacktester:
             if len(positions) >= self.cfg.max_positions:
                 continue
 
-            # 3) Build features from data up to and including candle `i`.
+            # Build slices (no lookahead)
             ts_ms = int(bar["ot"])
-            df_1m_slice = df1.iloc[: i + 1]
-            df_5m_slice = self._align_htf(data["5m"], ts_ms)
-            df_15m_slice = self._align_htf(data["15m"], ts_ms)
-            df_1h_slice = self._align_htf(data["1h"], ts_ms)
-            if len(df_15m_slice) < 50 or len(df_1h_slice) < 30:
+            d1m_slc = df1.iloc[: i + 1]
+            d15m_slc = self._htf_slice(d15, ts_ms)
+            d1h_slc = self._htf_slice(d1h, ts_ms)
+            if len(d15m_slc) < 30 or len(d1h_slc) < 20:
                 continue
 
-            feats = build_features(df_1m_slice, df_5m_slice, df_15m_slice, df_1h_slice)
-            if feats is None:
-                continue
+            # ML prob
+            ml_prob = self.ml.predict(symbol, d1m_slc) if trained else 0.5
 
-            ml_prob = ml_v2.predict(df_1m_slice, symbol)
-            sig = self.strategy.generate_signal(feats, ml_prob=ml_prob, ml_min=self.cfg.ml_min_prob)
+            sig = analyze_sync(d1m_slc, d15m_slc, d1h_slc, ml_prob)
             if sig is None:
                 continue
 
-            # 4) Size & enter on the NEXT bar's open (prevents look-ahead).
-            adj_risk = fractional_kelly_risk(self.cfg.risk_pct, rolling_win_rate, rolling_rr)
-            adj_risk *= (0.6 + 0.8 * sig.confidence)  # confidence scaling: 0.6x .. 1.4x
-            notional = position_notional(acct.balance, adj_risk, sig.entry, sig.sl)
-            if notional < 5:  # below Binance min notional on most futures pairs
+            # ML gate (additional guard)
+            if sig.side == "LONG" and ml_prob < self.cfg.ml_min_prob:
+                continue
+            if sig.side == "SHORT" and ml_prob > (1 - self.cfg.ml_min_prob):
                 continue
 
-            fill = _apply_slippage(sig.side, next_bar["o"], feats.atr_1m, is_market=True)
-            # Recompute stops/targets from the actual fill to keep R consistent
-            r = abs(sig.entry - sig.sl)
+            # Size: R-based
+            # risk = cfg.risk_pct * balance; notional = risk / sl_pct
+            risk_amt = acct.balance * self.cfg.risk_pct
+            sl_pct = sig.sl_pct
+            notional = risk_amt / (sl_pct / 100)
+            if notional < 5:
+                continue
+            notional = min(notional, acct.balance * 20)  # max 20x leverage
+
+            # Enter on NEXT bar open with slippage
+            atr_1m = MarketAnalyzer.get_atr(d1m_slc.tail(30), 14).iloc[-1]
+            if not math.isfinite(atr_1m) or atr_1m <= 0:
+                continue
+            fill = _slip(sig.side, float(next_bar["o"]), float(atr_1m), is_market=True)
+
             if sig.side == "LONG":
-                sl = fill - r
-                tp1 = fill + r * self.strategy.TP1_R
-                tp2 = fill + r * self.strategy.TP2_R
+                sl = fill * (1 - sl_pct / 100)
+                r = fill - sl
+                tp1 = fill + r * 1.0
+                tp2 = fill + fill * (sig.tp_pct / 100)
             else:
-                sl = fill + r
-                tp1 = fill - r * self.strategy.TP1_R
-                tp2 = fill - r * self.strategy.TP2_R
+                sl = fill * (1 + sl_pct / 100)
+                r = sl - fill
+                tp1 = fill - r * 1.0
+                tp2 = fill - fill * (sig.tp_pct / 100)
 
             positions.append(Position(
                 symbol=symbol, side=sig.side, entry=fill, size_usd=notional,
                 sl=sl, tp1=tp1, tp2=tp2, opened_at=i + 1, r_unit=r, setup=sig.setup,
             ))
 
-        # Close any still-open at last candle
-        last_bar_idx = len(df1) - 1
+        # Close remaining at last bar
+        last_idx = len(df1) - 1
         last_close = float(df1["c"].iloc[-1])
         for pos in positions:
-            closed = _close_position(pos, last_close, "EOD", last_bar_idx)
-            acct.balance += closed.pnl_usd
-            acct.trades.append(closed)
+            trade = _close(pos, last_close, "EOD", last_idx)
+            acct.balance += trade.pnl_usd
+            acct.trades.append(trade)
+            sym_trades += 1
+        return sym_trades
 
     async def run(self) -> AccountState:
         acct = AccountState(
@@ -398,29 +712,36 @@ class ProBacktester:
             peak_balance=self.cfg.starting_balance,
             day_start_balance=self.cfg.starting_balance,
         )
-
         if self.cfg.offline or not _HAS_HTTPX:
             for sym in self.cfg.symbols:
-                data = await self._load_symbol(None, sym)
+                data = await self._load(None, sym)
                 if not data:
+                    print(f"[warn] skip {sym}: no data")
                     continue
-                self._run_single(sym, data, acct)
+                n = self._run_symbol(sym, data, acct)
+                print(f"  {sym}: {n} trades  balance=${acct.balance:.2f}")
         else:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 for sym in self.cfg.symbols:
-                    data = await self._load_symbol(client, sym)
+                    data = await self._load(client, sym)
                     if not data:
-                        print(f"[warn] could not load {sym}, skipping")
+                        print(f"[warn] skip {sym}: no data")
                         continue
-                    self._run_single(sym, data, acct)
+                    n = self._run_symbol(sym, data, acct)
+                    print(f"  {sym}: {n} trades  balance=${acct.balance:.2f}")
         return acct
 
 
-# ---------- Reporting ----------
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
 
 def summarize(acct: AccountState, start_balance: float) -> None:
     trades = acct.trades
     n = len(trades)
+    print("\n" + "=" * 54)
+    print("BACKTEST RESULT (strategi LIVE: hybrid + analyzer + ML)")
+    print("=" * 54)
     if n == 0:
         print("No trades taken.")
         print(f"Final balance: ${acct.balance:.2f}")
@@ -428,71 +749,77 @@ def summarize(acct: AccountState, start_balance: float) -> None:
 
     pnls = np.array([t.pnl_usd for t in trades])
     wins = pnls[pnls > 0]
-    losses = pnls[pnls <= 0]
+    losses = pnls[pnls < 0]
     wr = len(wins) / n
-    avg_win = wins.mean() if len(wins) else 0.0
-    avg_loss = losses.mean() if len(losses) else 0.0
-    expectancy = pnls.mean()
-    pf = (-wins.sum() / losses.sum()) if losses.sum() < 0 else float("inf")
-    # Equity curve for drawdown & Sharpe proxy
+    avg_w = wins.mean() if len(wins) else 0.0
+    avg_l = losses.mean() if len(losses) else 0.0
+    expect = pnls.mean()
+    pf = (wins.sum() / -losses.sum()) if losses.sum() < 0 else float("inf")
     equity = start_balance + np.cumsum(pnls)
     peak = np.maximum.accumulate(equity)
     dd = (equity - peak) / peak
     max_dd = dd.min() if len(dd) else 0.0
-    returns = np.diff(equity) / equity[:-1] if len(equity) > 1 else np.array([])
-    sharpe = (returns.mean() / returns.std() * math.sqrt(1440)) if returns.std() > 0 else 0.0
+    rets = np.diff(equity) / equity[:-1] if len(equity) > 1 else np.array([])
+    sharpe = (rets.mean() / rets.std() * math.sqrt(1440)) if rets.std() > 0 else 0.0
 
-    print("\n=== RESULT ===")
     print(f"Trades            : {n}")
     print(f"Win rate          : {wr * 100:.1f}%")
-    print(f"Avg win / loss    : ${avg_win:+.3f} / ${avg_loss:+.3f}")
-    print(f"Expectancy / trade: ${expectancy:+.3f}")
+    print(f"Avg win / loss    : ${avg_w:+.3f} / ${avg_l:+.3f}")
+    print(f"Expectancy/trade  : ${expect:+.3f}")
     print(f"Profit factor     : {pf:.2f}")
     print(f"Max drawdown      : {max_dd * 100:.2f}%")
     print(f"Sharpe (1m basis) : {sharpe:.2f}")
-    print(f"Starting balance  : ${start_balance:.2f}")
-    print(f"Final balance     : ${acct.balance:.2f}  (net ${acct.balance - start_balance:+.2f})")
+    print(f"Start → Final     : ${start_balance:.2f} → ${acct.balance:.2f}  "
+          f"(net ${acct.balance - start_balance:+.2f}, {(acct.balance/start_balance-1)*100:+.2f}%)")
 
-    # Breakdown by setup
     from collections import defaultdict
-    by_setup = defaultdict(list)
+    by_setup = defaultdict(list); by_reason = defaultdict(list); by_sym = defaultdict(list)
     for t in trades:
         by_setup[t.setup].append(t.pnl_usd)
-    print("\nBy setup:")
-    for k, v in by_setup.items():
-        arr = np.array(v)
-        w = (arr > 0).mean() if len(arr) else 0
-        print(f"  {k:18s}  n={len(arr):3d}  wr={w * 100:4.1f}%  net=${arr.sum():+.2f}")
+        by_reason[t.reason].append(t.pnl_usd)
+        by_sym[t.symbol].append(t.pnl_usd)
+    print("\nPer-setup:")
+    for k, v in sorted(by_setup.items()):
+        a = np.array(v)
+        w = (a > 0).mean() if len(a) else 0
+        print(f"  {k:18s} n={len(a):3d}  wr={w*100:4.1f}%  net=${a.sum():+.2f}")
+    print("\nPer-exit-reason:")
+    for k, v in sorted(by_reason.items()):
+        a = np.array(v)
+        print(f"  {k:18s} n={len(a):3d}  net=${a.sum():+.2f}")
+    print("\nPer-symbol:")
+    for k, v in sorted(by_sym.items()):
+        a = np.array(v)
+        w = (a > 0).mean() if len(a) else 0
+        print(f"  {k:12s} n={len(a):3d}  wr={w*100:4.1f}%  net=${a.sum():+.2f}")
 
 
-# ---------- CLI ----------
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-def _parse_args():
-    p = argparse.ArgumentParser(description="Pro backtester for the scalper")
-    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT",
-                   help="comma-separated futures symbols")
-    p.add_argument("--days", type=int, default=1)
+def _parse():
+    p = argparse.ArgumentParser()
+    p.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT")
+    p.add_argument("--days", type=int, default=3)
     p.add_argument("--balance", type=float, default=100.0)
-    p.add_argument("--risk", type=float, default=0.01, help="base risk per trade, fraction")
-    p.add_argument("--max-positions", type=int, default=2)
-    p.add_argument("--offline", action="store_true",
-                   help="use synthetic data (required if sandbox has no internet)")
-    p.add_argument("--ml-min", type=float, default=0.55, help="ML probability gate")
+    p.add_argument("--risk", type=float, default=0.01)
+    p.add_argument("--max-positions", type=int, default=3)
+    p.add_argument("--offline", action="store_true")
+    p.add_argument("--ml-min", type=float, default=0.50)
     return p.parse_args()
 
 
 async def _amain():
-    args = _parse_args()
+    args = _parse()
     cfg = BacktestConfig(
         symbols=[s.strip() for s in args.symbols.split(",") if s.strip()],
-        days=args.days,
-        starting_balance=args.balance,
-        risk_pct=args.risk,
-        max_positions=args.max_positions,
-        offline=args.offline,
-        ml_min_prob=args.ml_min,
+        days=args.days, starting_balance=args.balance, risk_pct=args.risk,
+        max_positions=args.max_positions, offline=args.offline, ml_min_prob=args.ml_min,
     )
-    print(f"Running backtest | offline={cfg.offline} | days={cfg.days} | symbols={cfg.symbols}")
+    print(f"Backtest | offline={cfg.offline} days={cfg.days} risk={cfg.risk_pct*100:.1f}% "
+          f"max_pos={cfg.max_positions} ml_min={cfg.ml_min_prob}")
+    print(f"Symbols: {cfg.symbols}")
     bt = ProBacktester(cfg)
     acct = await bt.run()
     summarize(acct, cfg.starting_balance)

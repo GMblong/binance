@@ -5,7 +5,7 @@ from utils.state import bot_state, market_data
 from utils.helpers import round_step
 from engine.api import binance_request, get_symbol_precision
 from utils.logger import log_error
-from utils.intelligence import calculate_kelly_risk
+from utils.intelligence import calculate_kelly_risk, update_feature_weights
 from engine.ml_engine import ml_predictor
 from strategies.analyzer import MarketAnalyzer
 
@@ -58,23 +58,30 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
             notional = quantity * limit_price
         
         if quantity <= 0: return False
+        
+        # Minimum notional check (Binance requires $5-$20 depending on pair)
+        if notional < 5.5:
+            return False
 
         limit_price_str = f"{limit_price:.{prec['p_prec']}f}"
 
         # --- SET LEVERAGE EXPLICITLY DYNAMICALLY ---
-        # Attempt to set leverage starting from MAX_LEVERAGE down to 1.
-        for target_lev in [MAX_LEVERAGE, 25, 20, 15, 10, 5, 2, 1]:
+        # Use cached tier if available, otherwise try from MAX down
+        cached_lev = bot_state.get("_lev_cache", {}).get(symbol)
+        lev_targets = [cached_lev] if cached_lev else [MAX_LEVERAGE, 25, 20, 15, 10, 5, 2, 1]
+        
+        for target_lev in lev_targets:
             try:
                 lev_res = await binance_request(client, 'POST', '/fapi/v1/leverage', {"symbol": symbol, "leverage": target_lev})
                 if lev_res and lev_res.status_code == 200:
                     max_notional_tier = float(lev_res.json().get("maxNotionalValue", max_notional))
-                    # Safely cap quantity if it still exceeds the tier's max notional
+                    # Cache successful leverage for this symbol
+                    bot_state.setdefault("_lev_cache", {})[symbol] = target_lev
                     if notional > max_notional_tier:
                         quantity = round_step(max_notional_tier / limit_price * 0.9, prec["step"])
                         notional = quantity * limit_price
-                    break # Success, exit loop
+                    break
                 elif lev_res and lev_res.status_code == 400:
-                    # If Binance says this specific leverage is invalid, try the next one in the loop
                     continue
             except: pass
             
@@ -123,15 +130,15 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
                     tp_price = round_step(ref_price * tp_mult, prec["tick"])
                     tp_price_str = f"{tp_price:.{prec['p_prec']}f}"
 
-                    sl_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                    sl_res = await binance_request(client, 'POST', '/fapi/v1/order', {
                         "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
-                        "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": sl_price_str, 
+                        "type": "STOP_MARKET", "stopPrice": sl_price_str, 
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
 
-                    tp_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                    tp_res = await binance_request(client, 'POST', '/fapi/v1/order', {
                         "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
-                        "type": "TAKE_PROFIT_MARKET", "algoType": "CONDITIONAL", "triggerPrice": tp_price_str, 
+                        "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_price_str, 
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
                     
@@ -163,7 +170,8 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
                     "entry_time": time.time(),
                     "type": ai_brain.get("type", "INTRA"), 
                     "regime": ai_brain.get("regime", "TRENDING"), 
-                    "atr_pct": ai_brain.get("atr_pct", 0.5)
+                    "atr_pct": ai_brain.get("atr_pct", 0.5),
+                    "active_features": list(ai_brain.get("active_features", [])),
                 }
             return True
         else:
@@ -194,9 +202,19 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
             col = "green" if pnl > 0 else "red"
             bot_state["last_log"] = f"[bold {col}]CLOSED {symbol} ({reason}) | Est. PnL: {pnl:+.2f}%[/]"
             
-            # Update ML Predictor Performance & Bot State (Direct fallback to ensure UI updates)
+            # Mark as recently closed so WebSocket doesn't double-count
+            bot_state.setdefault("_recently_closed", {})[symbol] = time.time()
+
+            # Update ML Predictor Performance (single source of truth)
             is_win = pnl > 0
             ml_predictor.update_performance(symbol, is_win)
+
+            # Feedback loop: credit/penalize the features that fired at entry
+            trade_meta = bot_state.get("trades", {}).get(symbol, {})
+            active_feats = trade_meta.get("active_features") or []
+            if active_feats:
+                update_feature_weights(active_feats, is_win)
+
             if is_win:
                 bot_state["wins"] = bot_state.get("wins", 0) + 1
             else:
@@ -212,7 +230,6 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
                 bot_state["sym_perf"][symbol]['c'] += 1
                 bot_state["sym_perf"][symbol]['last_loss_time'] = time.time()
             
-            # W/L and Exact Daily PNL is now tracked via WebSocket's Realized Profit (rp) event
             if symbol in bot_state["trades"]: del bot_state["trades"][symbol]
             return True
         return False
@@ -467,12 +484,14 @@ async def manage_active_positions(client, all_signals):
                         "ts_act": ai.get("ts_act", 0.8), "ts_cb": ai.get("ts_cb", 0.25), 
                         "side": side, "entry_time": lo_data.get("timestamp", time.time()),
                         "type": ai.get("type", "INTRA"), "regime": ai.get("regime", "TRENDING"), 
-                        "atr_pct": ai.get("atr_pct", 0.5)
+                        "atr_pct": ai.get("atr_pct", 0.5),
+                        "active_features": list(ai.get("active_features", [])),
                     }
                 else:
                     bot_state["trades"][symbol] = {
                         "peak": mark_price, "tp": 2.0, "sl": 1.0, "ts_act": 0.8, "ts_cb": 0.25, 
-                        "side": side, "entry_time": time.time(), "type": "INTRA"
+                        "side": side, "entry_time": time.time(), "type": "INTRA",
+                        "active_features": [],
                     }
             
             # CRITICAL: Always remove from limit_orders if we found an active position for this symbol
@@ -520,9 +539,9 @@ async def manage_active_positions(client, all_signals):
                         sl_order = next(o for o in symbol_orders if o['type'] in ['STOP_MARKET', 'STOP'])
                         await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": sl_order["orderId"]})
                     
-                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                    await binance_request(client, 'POST', '/fapi/v1/order', {
                         "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
-                        "type": "STOP_MARKET", "algoType": "CONDITIONAL", "triggerPrice": f"{sl_price:.{prec['p_prec']}f}",
+                        "type": "STOP_MARKET", "stopPrice": f"{sl_price:.{prec['p_prec']}f}",
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
 
