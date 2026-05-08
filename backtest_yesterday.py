@@ -30,6 +30,16 @@ def detect_lead_lag_sim(sub_sym, sub_lead):
     return 0
 
 async def get_top_movers(client, limit=10):
+    # Prefer the liquidity + trend-persistence picker over the legacy
+    # "top mover by abs(24h change)" which ranks exactly the coins most
+    # likely to reverse. The old behaviour is kept as a fallback below.
+    try:
+        from backtest.universe import select_liquid_trending
+        picked = await select_liquid_trending(client, API_URL, limit=limit)
+        if picked:
+            return picked
+    except Exception:
+        pass
     res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
     data = res.json()
     filtered = [t for t in data if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 10_000_000]

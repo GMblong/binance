@@ -89,15 +89,53 @@ async def analyze_hybrid_async(client, symbol):
             return None
         
         # --- HIGHER TIMEFRAME (HTF) BIAS ---
-        htf_direction = direction
+        # Compute 1h trend using both EMA20 and EMA50 so we can enforce a HARD
+        # gate (1h direction must agree with 15m direction in trending/volatile
+        # regimes). Ambiguous 1h (price between EMA20 and EMA50) returns 0.
+        try:
+            ema20_1h = MarketAnalyzer.get_ema(d1h["c"], 20).iloc[-1]
+            ema50_1h = (
+                MarketAnalyzer.get_ema(d1h["c"], 50).iloc[-1]
+                if len(d1h) >= 50
+                else ema20_1h
+            )
+            last_1h_close = d1h["c"].iloc[-1]
+            if last_1h_close > ema20_1h and ema20_1h >= ema50_1h:
+                htf_direction = 1
+            elif last_1h_close < ema20_1h and ema20_1h <= ema50_1h:
+                htf_direction = -1
+            else:
+                htf_direction = 0
+        except Exception:
+            htf_direction = direction
+
+        # 1m direction for hard-gate confirmation.
+        try:
+            ema9_1m_val = MarketAnalyzer.get_ema(d1m["c"], 9).iloc[-1]
+            ema21_1m_val = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
+            dir_1m_val = 1 if ema9_1m_val > ema21_1m_val else -1
+        except Exception:
+            dir_1m_val = direction
         mtf_aligned = True
-        
+
         # --- INSTITUTIONAL DATA GATHERING ---
         imbalance = await get_orderbook_imbalance(client, symbol)
         funding = market_data.funding.get(symbol, 0.0)
         regime = MarketAnalyzer.detect_regime(d15m)
         session = get_current_session()
         lead_lag = detect_lead_lag(symbol)
+
+        # --- HARD MTF GATE ---
+        # In TRENDING / VOLATILE we require 1h == 15m == 1m direction. In
+        # RANGING we still require 1m to confirm the side (otherwise we are
+        # just a coin-flip). This single filter removes the bulk of the
+        # losing trades that used to sneak through on an ML score boost.
+        if regime in ("TRENDING", "VOLATILE"):
+            if htf_direction == 0 or htf_direction != direction or dir_1m_val != direction:
+                return None
+        else:
+            if dir_1m_val != direction:
+                return None
         
         # --- PER-SYMBOL DYNAMIC WEIGHTS ---
         # Try to get specific weights for this symbol, fallback to global weights
@@ -196,38 +234,63 @@ async def analyze_hybrid_async(client, symbol):
         prev_15_high = d1m['h'].iloc[-16:-1].max()
         prev_15_low = d1m['l'].iloc[-16:-1].min()
         is_breakout = (direction == 1 and price > prev_15_high) or (direction == -1 and price < prev_15_low)
-        
-        # Logika Baru: Adaptive Threshold berdasarkan Regime & Breakout
+
+        # --- THRESHOLD + EV GATE ---
+        # Score threshold is still used as a coarse filter, but the final
+        # go/no-go is the EV gate: expected value per trade AFTER costs must
+        # exceed a minimum positive number.
         threshold = 75
         if regime == "VOLATILE":
-            threshold = 70 if is_breakout else 85 
+            threshold = 78 if is_breakout else 85
         elif regime == "RANGING":
-            threshold = 85  
+            threshold = 85
         elif regime == "TRENDING":
-            threshold = 75 if is_breakout else 80
-            
+            threshold = 78 if is_breakout else 82
+
+        # Estimate per-round-trip cost (maker entry + taker exit + slippage
+        # scaled with ATR%). Matches backtest/cost_model.py constants so the
+        # live gate and the backtest gate agree.
+        cost_fee_maker = 0.02   # % taker-side fee
+        cost_fee_taker = 0.04   # %
+        slip_floor = 0.03       # %
+        slip_atr_coef = 0.30
+        roundtrip_cost_pct = (
+            cost_fee_maker + cost_fee_taker + slip_floor + slip_atr_coef * base_atr_pct
+        )
+
+        # Directional win probability from ML + score edge. Score beyond the
+        # regime floor adds a small edge; ML prob is the dominant input.
+        p_ml = ml_prob if direction == 1 else (1 - ml_prob)
+        score_edge = max(0.0, (score - threshold) / 100.0) * 0.4  # max ~0.1
+        p_win = max(p_ml, 0.5 + score_edge)
+        ev_pct = p_win * tp_pct - (1 - p_win) * sl_pct - roundtrip_cost_pct
+        MIN_EV_PCT = 0.10  # require at least +0.10% expected value per trade
+
         # --- ADAPTIVE EXECUTION ENGINE ---
-        # 1. Decide Entry Mode based on Regime and Score
+        # MARKET entries are reserved for the rare case where all of:
+        #   - structural 15-bar breakout has already printed,
+        #   - ML directional prob >= 0.72 in our favor,
+        #   - EV after taker-both-sides still >= MIN_EV_PCT,
+        # are true. Otherwise we always use a limit order at a structurally
+        # meaningful level (FVG / OB / EMA9).
         is_market_order = False
-        
-        if regime == "TRENDING":
-            # In Trending markets, ONLY FOMO/Market Execute if it's a breakout AND conviction is high (>=88)
-            # or if the overall score is absolutely extreme (>=95)
-            if (is_breakout and score >= 88) or score >= 95:
-                is_market_order = True
-                limit_p = price # Market Execution
-        elif regime == "VOLATILE":
-            # In Volatile markets, we ONLY use market orders if it's a confirmed breakout with extreme score
-            if is_breakout and score >= 95:
-                is_market_order = True
-                limit_p = price
-        # In RANGING mode, we stay 100% Sniper (Limit Only)
+        if is_breakout:
+            strong_ml = (direction == 1 and ml_prob >= 0.72) or (
+                direction == -1 and ml_prob <= 0.28
+            )
+            if strong_ml and score >= 90:
+                market_cost_pct = (
+                    2 * cost_fee_taker + 2 * slip_floor
+                    + 2 * slip_atr_coef * base_atr_pct
+                )
+                if (p_win * tp_pct - (1 - p_win) * sl_pct - market_cost_pct) >= MIN_EV_PCT:
+                    is_market_order = True
+                    limit_p = price
 
         signal = "WAIT"
         dist = abs(price - limit_p) / price * 100
-        
-        if score >= threshold:
-            # Sniper logic: Only signal if we are reasonably close to our target or if it's a market order
+
+        if score >= threshold and ev_pct >= MIN_EV_PCT:
             if is_market_order or dist <= 0.6:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
         
@@ -236,8 +299,15 @@ async def analyze_hybrid_async(client, symbol):
             "sig": signal, "score": int(score), "struct": struct[:4], "dir": int(direction), "dir_15m": int(direction),
             "regime": regime, "ai": {
                 "tp": float(tp_pct), "sl": float(sl_pct), "limit_price": float(limit_p),
-                "ts_act": float(sl_pct * 0.8), "ts_cb": float(sl_pct * 0.3), 
-                "type": "SCALP", "regime": regime, "score": int(score), "ml_prob": float(round(ml_prob, 2)),
+                "ts_act": float(sl_pct * 0.8),
+                # Trailing callback: used to be sl*0.3 which was too tight --
+                # even a 0.3% wiggle closed winners too early. Raise to 0.5
+                # with a hard floor so small SLs don't produce micro callbacks.
+                "ts_cb": float(max(sl_pct * 0.5, 0.25)),
+                "type": "SCALP", "regime": regime, "score": int(score),
+                "ml_prob": float(round(ml_prob, 2)),
+                "p_win": float(round(p_win, 3)),
+                "ev_pct": float(round(ev_pct, 3)),
                 "is_market": is_market_order
             }
         }

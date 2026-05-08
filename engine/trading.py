@@ -61,9 +61,23 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
 
         limit_price_str = f"{limit_price:.{prec['p_prec']}f}"
 
+        # --- ADAPTIVE LEVERAGE CAP ---
+        # The goal is to make sure that if price hits our SL, we lose
+        # roughly `risk_amt`, NOT get liquidated first. A conservative rule:
+        # the liquidation distance must be >= 2x the SL distance. With
+        # isolated margin, liquidation distance ~= 1/leverage - maintenance.
+        # Solving: max safe leverage ~= 0.5 / sl_pct_decimal.
+        sl_pct_dec = max(sl_pct, 0.5) / 100.0
+        safe_lev = max(1, int(0.5 / sl_pct_dec))
+        target_max_lev = min(MAX_LEVERAGE, safe_lev)
+
         # --- SET LEVERAGE EXPLICITLY DYNAMICALLY ---
-        # Attempt to set leverage starting from MAX_LEVERAGE down to 1.
-        for target_lev in [MAX_LEVERAGE, 25, 20, 15, 10, 5, 2, 1]:
+        # Attempt to set leverage starting from the ADAPTIVE cap down to 1.
+        # (Previously we always tried MAX_LEVERAGE first, which could leave
+        # the position one whipsaw away from liquidation on tight-SL trades.)
+        for target_lev in [target_max_lev, 25, 20, 15, 10, 5, 2, 1]:
+            if target_lev > target_max_lev:
+                continue
             try:
                 lev_res = await binance_request(client, 'POST', '/fapi/v1/leverage', {"symbol": symbol, "leverage": target_lev})
                 if lev_res and lev_res.status_code == 200:
@@ -288,14 +302,19 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         # Smart Breakeven Logic
         initial_sl_pct = ai.get("sl", 1.0)
         if not reason and pnl_pct >= initial_sl_pct:
-            # If we hit RR 1:1, ensure we don't lose money on this trade anymore.
-            # We don't close it yet, but we will exit if it drops back to BE.
-            # Fee buffer: 0.1% to cover entry and exit taker fees
-            be_buffer = 0.1 
+            # After we have hit >= 1R in profit, ratchet the floor to BE plus a
+            # buffer that covers 2x taker fee + slippage (previously 0.1% --
+            # too thin to actually protect the trade). 0.15% covers fee
+            # round-trip (~0.08%) plus typical alt slippage.
+            be_buffer = 0.15
             if peak_pnl >= initial_sl_pct and pnl_pct <= be_buffer:
                 reason = "SMART-BE (Hit RR 1:1 and dropped)"
 
-        # 2. Smart Reversal & Momentum Check
+        # 2. Smart Reversal Check (Momentum-Dead exit was REMOVED: it
+        # systematically cut winners at just +0.3% pnl before fees, which
+        # mathematically destroys expected value. Reversal exits are kept
+        # but gated: only trigger after we already banked >= 0.5R in profit
+        # OR the counter-signal is very strong (score >= 75 against us).
         if EXIT_ON_REVERSAL and not reason and all_signals:
             sym_short = symbol.replace("USDT", "")
             curr_sig = next((s for s in all_signals if s["sym"] == sym_short), None)
@@ -303,26 +322,20 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
                 sig_dir = curr_sig["dir"]
                 curr_score = curr_sig.get("score", 0)
                 ml_prob = curr_sig["ai"].get("ml_prob", 0.5)
-                
-                # Check VSA logic if market data is available
-                vsa_sig = 0
-                k1m = market_data.klines.get(symbol, {}).get("1m")
-                if k1m is not None:
-                    vsa_sig = MarketAnalyzer.detect_vsa_signals(k1m)
-                
-                # Reversal Logic
-                if side == "LONG" and sig_dir == -1 and ml_prob < 0.4:
+
+                strong_counter = curr_score >= 75
+                banked_half_r = pnl_pct >= (initial_sl_pct * 0.5)
+
+                if side == "LONG" and sig_dir == -1 and ml_prob < 0.35 and strong_counter:
                     reason = "AI-REVERSAL (BEARISH)"
-                elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.6:
+                elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.65 and strong_counter:
                     reason = "AI-REVERSAL (BULLISH)"
-                elif pnl_pct > 0.3:
-                    # Momentum Dead Logic (Sharpened with VSA)
-                    if side == "LONG" and curr_score < 30 and ml_prob < 0.5:
-                        if vsa_sig == -1: reason = "SMART-TP (MOMENTUM DEAD + VSA BEARISH)"
-                        else: reason = "SMART-TP (MOMENTUM DEAD)"
-                    elif side == "SHORT" and curr_score < 30 and ml_prob > 0.5:
-                        if vsa_sig == 1: reason = "SMART-TP (MOMENTUM DEAD + VSA BULLISH)"
-                        else: reason = "SMART-TP (MOMENTUM DEAD)"
+                elif banked_half_r and strong_counter:
+                    # Only in profit and counter-signal strong -- lock gains.
+                    if side == "LONG" and sig_dir == -1:
+                        reason = "AI-BANKED-GAIN (Counter-signal)"
+                    elif side == "SHORT" and sig_dir == 1:
+                        reason = "AI-BANKED-GAIN (Counter-signal)"
 
         if reason:
             ai["exit_pending"] = True

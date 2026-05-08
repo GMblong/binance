@@ -33,6 +33,15 @@ def detect_lead_lag_sim(sub_sym, sub_lead):
     return 0
 
 async def get_top_movers(client, limit=5):
+    # Prefer liquidity + trend-persistence picker; fall back to legacy
+    # "top abs(change)" selector if the new one is unavailable.
+    try:
+        from backtest.universe import select_liquid_trending
+        picked = await select_liquid_trending(client, API_URL, limit=limit)
+        if picked:
+            return picked
+    except Exception:
+        pass
     res = await client.get(f"{API_URL}/fapi/v1/ticker/24hr")
     data = res.json()
     filtered = [t for t in data if t["symbol"].endswith("USDT") and float(t["quoteVolume"]) > 10_000_000]
@@ -52,7 +61,14 @@ async def run_backtest():
     starting_balance = 100.0
     balance = starting_balance
     risk_percent = 0.02 # Updated to 2%
-    
+
+    console.print(
+        "[bold yellow]NOTE:[/] This is the legacy backtester. "
+        "Use [bold]backtest_honest.py[/] for the look-ahead-free, cost- and "
+        "fill-realistic engine. This script now passes an end_time to "
+        "ml_predictor.train_model so at least the ML part is no longer "
+        "leaky, but fills and fees remain optimistic.\n"
+    )
     console.print(f"[bold green]=== Backtest Simulator (Last 24 Hours) ===[/]")
     console.print(f"Starting Balance: ${balance:.2f}\n")
     console.print(f"Using Neural Weights: {bot_state.get('neural_weights')}\n")
@@ -67,15 +83,23 @@ async def run_backtest():
         for symbol in symbols:
             console.print(f"[bold cyan]=> Analyzing {symbol}...[/]")
             
-            # 1. Train AI
-            console.print("   [dim]Training LightGBM AI Model with historical data...[/dim]")
-            await ml_predictor.train_model(client, symbol)
-            
+            # 1. Train AI  -- CRITICAL: cut training data BEFORE the sim window
+            # starts to avoid look-ahead bias. Sim covers the last 1440m; so
+            # training must end at (now - 1440 * 60 * 1000) ms.
+            import time as _t
+            sim_end_ms = int(_t.time() * 1000)
+            train_end_ms = sim_end_ms - 1440 * 60 * 1000
+            console.print(
+                "   [dim]Training LightGBM AI Model with historical data "
+                "(cutoff strictly before sim start to prevent look-ahead)...[/dim]"
+            )
+            await ml_predictor.train_model(client, symbol, end_time=train_end_ms)
+
             # 2. Fetch Data
             df_1m = await fetch_klines(client, symbol, "1m", limit=1500)
             df_15m = await fetch_klines(client, symbol, "15m", limit=200)
             if df_1m.empty or df_15m.empty: continue
-            
+
             # Ensure we simulate exactly 1 day (1440 minutes)
             sim_data = df_1m.iloc[-1440:].copy().reset_index(drop=True)
             
