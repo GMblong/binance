@@ -39,6 +39,10 @@ bot_state = {
     "directional_bias": 0, # Net direction of current positions
     "sym_weights": {}, # {symbol: {regime:feature: weight}}
     "ui_active": False, # If True, keyboard listener is paused
+    "api_err_count": 0, # API Circuit Breaker counters
+    "api_req_count": 0,
+    "api_health_status": "OK", # OK, DEGRADED, BLOCKED
+    "last_db_save": 0, # Batched DB save timestamp
 }
 
 symbol_info_cache = {}

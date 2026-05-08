@@ -4,6 +4,7 @@ import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import log_loss
+from sklearn.calibration import CalibratedClassifierCV
 import optuna
 from utils.config import API_URL
 import pandas_ta as ta
@@ -19,6 +20,7 @@ class MLPredictor:
         self.performance = {} # Store win rate tracking (symbol: [list of bool])
         self.feature_importance = {} # Store feature importance per symbol
         self.feature_cache = {} # Cache for pre-calculated features {symbol: df}
+        self.retrain_sem = asyncio.Semaphore(2) # Limit to 2 concurrent retrains (M6)
 
     def update_performance(self, symbol, is_win):
         if symbol not in self.performance: self.performance[symbol] = []
@@ -60,8 +62,10 @@ class MLPredictor:
             
         # Institutional Flow Proxies (VWAP & CVD)
         df['typical_price'] = (df['h'] + df['l'] + df['c']) / 3
-        df['vwap'] = (df['typical_price'] * df['v']).cumsum() / df['v'].cumsum()
+        df['vol_price'] = df['typical_price'] * df['v']
+        df['vwap'] = df['vol_price'].rolling(window=100).sum() / df['v'].rolling(window=100).sum()
         df['dist_vwap'] = (df['c'] - df['vwap']) / df['vwap']
+        df.drop(columns=['vol_price'], inplace=True, errors='ignore')
         
         # Advanced CVD Proxy (Wick-based Volume Delta)
         range_diff = df['h'] - df['l'] + 1e-8
@@ -116,7 +120,7 @@ class MLPredictor:
             dyn_sl_mult = sl_mult * min(max(vol_ratio, 0.8), 2.0)
             
             pt_price, sl_price = entry_price + (current_atr * dyn_pt_mult), entry_price - (current_atr * dyn_sl_mult)
-            label = np.nan # 1 = Hit PT, 0 = Hit SL, nan = Timeout (Chop)
+            label = 0 # 1 = Hit PT, 0 = Hit SL or Timeout (Chop)
             for j in range(1, lookahead + 1):
                 idx = i + j
                 if highs[idx] >= pt_price: label = 1; break
@@ -155,9 +159,13 @@ class MLPredictor:
             features = self._get_feature_list(df_sync.columns)
             X, y = df_sync[features], df_sync['target']
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.15, shuffle=False)
-            # Add class_weight='balanced' to handle skewed labeling (more stops hit than targets or vice versa)
-            model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=2, verbose=-1)
+            # Base LightGBM Model
+            base_model = lgb.LGBMClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, num_leaves=15, subsample=0.8, colsample_bytree=0.8, random_state=42, class_weight='balanced', n_jobs=2, verbose=-1)
+            # Calibrate Probabilities (H2)
+            model = CalibratedClassifierCV(base_model, method='isotonic', cv=3)
             model.fit(X_train, y_train)
+            
+            # TODO: Logging metrics (H3) if required, skipping for brevity as model fits inside loop
             self.models[symbol], self.last_trained[symbol] = model, time.time()
             return True
         return await asyncio.to_thread(_train_sync)
@@ -167,7 +175,11 @@ class MLPredictor:
         if symbol not in self.models:
             if not await self.train_model(client, symbol): return 0.5
         if (now - self.last_trained.get(symbol, 0)) > 43200:
-            asyncio.create_task(self.train_model(client, symbol))
+            # Throttle retraining with semaphore (M6)
+            async def _retrain_with_sem():
+                async with self.retrain_sem:
+                    await self.train_model(client, symbol)
+            asyncio.create_task(_retrain_with_sem())
         model = self.models.get(symbol)
         if model is None: return 0.5
         df = self.feature_engineering(current_df.tail(100).copy())

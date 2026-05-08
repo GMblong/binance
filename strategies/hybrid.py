@@ -27,20 +27,14 @@ async def get_btc_trend(client):
 
 async def analyze_hybrid_async(client, symbol):
     if symbol in busy_symbols: 
-        with open("sync_debug.log", "a") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Skipping - in busy_symbols\n")
         return None
     try:
         now = time.time()
-        with open("sync_debug.log", "a") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Starting analysis cycle\n")
         if symbol not in market_data.klines: market_data.klines[symbol] = {}
         
         last_p = market_data.last_prime.get(symbol, 0)
         # Force sync if data is missing
         if "1m" not in market_data.klines.get(symbol, {}) or (now - last_p) > 60: 
-            with open("sync_debug.log", "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Attempting sync. last_p: {last_p}, now: {now}\n")
             busy_symbols.add(symbol)
             try:
                 async with api_sem:
@@ -51,13 +45,9 @@ async def analyze_hybrid_async(client, symbol):
                     res15 = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15)
                     res1h = await client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15)
                     
-                    with open("sync_debug.log", "a") as f:
-                        f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Statuses: {res1.status_code}, {res15.status_code}, {res1h.status_code}\n")
                     
                     if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
                         data1, data15, data1h = res1.json(), res15.json(), res1h.json()
-                        with open("sync_debug.log", "a") as f:
-                            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Received JSON lengths: {len(data1)}, {len(data15)}, {len(data1h)}\n")
 
                         def proc(data):
                             df = pd.DataFrame(data).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
@@ -72,22 +62,16 @@ async def analyze_hybrid_async(client, symbol):
                     else:
                         # SET LAST_PRIME TO AVOID SPAMMING ON FAILURE (Backoff 30 seconds)
                         market_data.last_prime[symbol] = now - 30 
-                        with open("sync_debug.log", "a") as f:
-                            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: API Fail - Statuses: {res1.status_code}, {res15.status_code}, {res1h.status_code}\n")
             finally:
                 busy_symbols.discard(symbol)
 
         k = market_data.klines.get(symbol, {})
         # Re-check cache *after* sync attempt
         if "1m" not in k or "15m" not in k or "1h" not in k: 
-            with open("sync_debug.log", "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Still missing data. Found keys: {list(k.keys())}\n")
             return None
 
         d1m, d15m, d1h = k["1m"], k["15m"], k["1h"]
         
-        with open("sync_debug.log", "a") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Proceeding to indicator calculation\n")
 
         try:
             price = d1m["c"].iloc[-1]
@@ -100,13 +84,8 @@ async def analyze_hybrid_async(client, symbol):
             
             direction = 1 if ema9_15m > ema21_15m else -1
             
-            with open("sync_debug.log", "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Indicators: Ema9_15: {ema9_15m}, Ema21_15: {ema21_15m}, Dir: {direction}\n")
             
-            # ... [rest of the logic]
         except Exception as e:
-            with open("sync_debug.log", "a") as f:
-                f.write(f"[{time.strftime('%H:%M:%S')}] {symbol}: Calculation Error: {str(e)}\n")
             return None
         
         # --- HIGHER TIMEFRAME (HTF) BIAS ---
@@ -150,6 +129,19 @@ async def analyze_hybrid_async(client, symbol):
         
         score = min(max(score + ml_score_boost, 0), 100)
         
+        # --- LIQUIDATION MAGNET (M2) ---
+        liq = MarketAnalyzer.predict_liquidation_clusters(d15m)
+        if liq:
+            if "liq_map" not in bot_state: bot_state["liq_map"] = {}
+            bot_state["liq_map"][symbol] = liq
+            
+            # If LONG, price is drawn up to short_liq (liquidating shorters)
+            if direction == 1 and any(p > price for p in liq["short_liq"]):
+                score = min(score + 5, 100)
+            # If SHORT, price is drawn down to long_liq (liquidating longers)
+            elif direction == -1 and any(p < price for p in liq["long_liq"]):
+                score = min(score + 5, 100)
+        
         # --- ENTRY LOGIC (Full Sniper - Limit Only) ---
         # Default target: EMA9 (Pullback Level)
         limit_p = ema9_1m
@@ -164,19 +156,27 @@ async def analyze_hybrid_async(client, symbol):
             if fvg and fvg["type"] == "BEARISH":
                 limit_p = fvg["bottom"]
 
-        # --- SMART MARKET STRUCTURE SL & TP ---
+        # --- SMART MARKET STRUCTURE SL & TP (H6) ---
         base_atr_pct = (atr / price) * 100
-        buffer_pct = base_atr_pct * 0.2 # 0.2x ATR buffer
+        buffer_pct = max(base_atr_pct * 0.3, 0.15) # 0.3x ATR or 0.15% minimum buffer
         
         ob = MarketAnalyzer.find_nearest_order_block(d1m, price, direction)
         
+        # Multi-level Swing Search for better safety
+        recent_low_L1 = d1m['l'].tail(15).min()
+        recent_low_L2 = d1m['l'].tail(30).min()
+        recent_high_L1 = d1m['h'].tail(15).max()
+        recent_high_L2 = d1m['h'].tail(30).max()
+        
         if direction == 1:
-            # LONG SL: Below Order Block or Recent Low
-            sl_price = ob["bottom"] if ob else (recent_low if recent_low else price * (1 - 0.01))
+            # LONG SL: Try to use L2 if it's within reasonable risk (< 3.0%), otherwise L1
+            struct_low = recent_low_L2 if ((price - recent_low_L2) / price * 100) <= 3.0 else recent_low_L1
+            sl_price = ob["bottom"] if ob else (struct_low if struct_low else price * (1 - 0.01))
             sl_pct = ((price - sl_price) / price * 100) + buffer_pct
         else:
-            # SHORT SL: Above Order Block or Recent High
-            sl_price = ob["top"] if ob else (recent_high if recent_high else price * (1 + 0.01))
+            # SHORT SL: Try to use L2 if it's within reasonable risk (< 3.0%), otherwise L1
+            struct_high = recent_high_L2 if ((recent_high_L2 - price) / price * 100) <= 3.0 else recent_high_L1
+            sl_price = ob["top"] if ob else (struct_high if struct_high else price * (1 + 0.01))
             sl_pct = ((sl_price - price) / price * 100) + buffer_pct
             
         # Fallback & Safety bounds

@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.align import Align
 
-from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER
+from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT
 from utils.state import bot_state, market_data
 from engine.websocket import ws_manager
 from engine.api import binance_request, get_balance_async, get_market_depth_data
@@ -47,6 +47,21 @@ async def trading_loop(client):
             now = time.time()
             loop_count += 1
             
+            # --- KILL-SWITCH HARIAN (C1) ---
+            if bot_state.get("start_balance", 0) > 0:
+                daily_pnl_pct = ((bot_state.get("balance", 0) - bot_state["start_balance"]) / bot_state["start_balance"]) * 100
+                if daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT or daily_pnl_pct >= DAILY_PROFIT_TARGET_PCT:
+                    if not bot_state.get("is_passive", False):
+                        bot_state["is_passive"] = True
+                        bot_state["last_log"] = f"[bold red]KILL-SWITCH ACTIVATED (PnL: {daily_pnl_pct:.2f}%)![/]"
+                        # Clean up positions and orders
+                        active_pos = bot_state.get("active_positions", [])
+                        for p in active_pos:
+                            await close_position_async(client, p['symbol'], "LONG" if float(p['positionAmt'])>0 else "SHORT", float(p['positionAmt']), "KILL-SWITCH")
+                        for sym in list(bot_state.get("limit_orders", {}).keys()):
+                            await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
+                        bot_state["limit_orders"] = {}
+                        
             # 1. Slow Cycle: BTC Trend and Full Ticker Refresh
             is_ws_stale = (now - bot_state.get("ws_last_msg", 0)) > 30
             
@@ -178,6 +193,17 @@ async def trading_loop(client):
                     # PREVENT DUPLICATES: Skip if already in active position OR already has a pending limit order
                     if any(p['symbol'] == sym_full for p in active_pos): continue
                     
+                    # --- BLACKLIST & COOLDOWN FILTER (C2 & C3) ---
+                    if bot_state.get("blacklist", {}).get(sym_full, 0) > time.time(): continue
+                    
+                    sym_perf = bot_state.get("sym_perf", {}).get(sym_full, {})
+                    if sym_perf.get("c", 0) >= 3:
+                        last_loss = sym_perf.get("last_loss_time", 0)
+                        if time.time() - last_loss < 3600: # 60 menit cooldown pasca 3 beruntun loss
+                            bot_state.setdefault("blacklist", {})[sym_full] = time.time() + 3600
+                            bot_state["sym_perf"][sym_full]["c"] = 0 # Reset biar tidak infinite loop
+                            continue
+                            
                     is_replacement = sym_full in bot_state.get("limit_orders", {})
                     # If already has a limit order and it's NOT a replacement (same direction), skip it
                     if is_replacement:
@@ -214,7 +240,33 @@ async def trading_loop(client):
                             await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
 
             bot_state["heartbeat"] += 1
-            await asyncio.to_thread(save_state_to_db)
+            
+            # --- API CIRCUIT BREAKER (M5) & BATCHED DB WRITES (M3) ---
+            if now - bot_state.get("last_db_save", 0) > 30:
+                # 1. API Circuit Breaker Eval
+                reqs = bot_state.get("api_req_count", 0)
+                errs = bot_state.get("api_err_count", 0)
+                if reqs > 10:
+                    err_rate = errs / reqs
+                    if err_rate > 0.3: # >30% error rate
+                        bot_state["api_health_status"] = "BLOCKED"
+                        bot_state["last_log"] = f"[bold white on red]API CIRCUIT BREAKER! Rate: {err_rate*100:.1f}%[/]"
+                    elif err_rate > 0.1:
+                        bot_state["api_health_status"] = "DEGRADED"
+                    else:
+                        bot_state["api_health_status"] = "OK"
+                        
+                bot_state["api_req_count"] = 0
+                bot_state["api_err_count"] = 0
+                
+                # Auto-recovery after 60s of silence
+                if bot_state.get("api_health_status") == "BLOCKED" and errs == 0:
+                     bot_state["api_health_status"] = "OK"
+                     
+                # 2. Batched DB Writes
+                await asyncio.to_thread(save_state_to_db)
+                bot_state["last_db_save"] = now
+
             await asyncio.sleep(1.5) # Relaxed loop
         except Exception as e:
             bot_state["last_log"] = f"[red]Loop Err: {str(e)[:40]}[/]"

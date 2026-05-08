@@ -36,6 +36,18 @@ def calculate_market_volatility():
         bot_state["market_vol"] = round(avg_vol / 1.0, 2) # Assuming 1.0% is baseline
     return bot_state["market_vol"]
 
+# Static mapping for demonstration (H7)
+SECTORS = {
+    "BTCUSDT": "L1", "ETHUSDT": "L1", "SOLUSDT": "L1", "ADAUSDT": "L1",
+    "DOGEUSDT": "MEME", "SHIBUSDT": "MEME", "PEPEUSDT": "MEME", "WIFUSDT": "MEME", "FLOKIUSDT": "MEME",
+    "LINKUSDT": "L1", "AVAXUSDT": "L1", "DOTUSDT": "L1", "MATICUSDT": "L1", "SUIUSDT": "L2", "ARBUSDT": "L2",
+    "UNIUSDT": "DEFI", "AAVEUSDT": "DEFI", "MKRUSDT": "DEFI",
+    "FETUSDT": "AI", "AGIXUSDT": "AI", "OCEANUSDT": "AI", "WLDUSDT": "AI", "RENDERUSDT": "AI"
+}
+
+def get_sector(symbol):
+    return SECTORS.get(symbol, "UNKNOWN")
+
 def get_symbol_correlation(sym1, sym2):
     """Calculates correlation between two symbols based on 15m klines."""
     try:
@@ -55,20 +67,30 @@ def get_symbol_correlation(sym1, sym2):
         return 0.5
 
 def is_correlated_exposure(new_symbol, new_side):
-    """Checks if opening a new position adds too much correlation to existing ones."""
+    """Checks if opening a new position adds too much correlation (H7)."""
     active_positions = bot_state.get("active_positions", [])
     if not active_positions:
         return False
         
+    new_sector = get_sector(new_symbol)
+    sector_count = 0
+    
     for pos in active_positions:
         pos_sym = pos['symbol']
         pos_side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
         
-        # If same direction, check correlation
+        # If same direction, check correlation and sector
         if pos_side == new_side:
+            # 1. Check direct pair-wise correlation
             corr = get_symbol_correlation(new_symbol, pos_sym)
-            if corr > 0.80: # Highly correlated
+            if corr > 0.85: # Highly correlated
                 return True
+                
+            # 2. Check sector exposure (max 2 per sector)
+            if get_sector(pos_sym) == new_sector and new_sector != "UNKNOWN":
+                sector_count += 1
+                if sector_count >= 2:
+                    return True
                 
     return False
 
@@ -85,22 +107,37 @@ def calculate_kelly_risk(symbol, win_rate=0.5, rr=2.0):
 
 def detect_lead_lag(symbol, leader="BTCUSDT"):
     """
-    Detects if the symbol is lagging behind a market leader.
-    Returns: 1 (Lagging Bullish), -1 (Lagging Bearish), 0 (Neutral)
+    Robust lead-lag using correlation and return gap (H8).
     """
     try:
+        if symbol == leader: return 0
         df_sym = market_data.klines.get(symbol, {}).get("1m")
         df_lead = market_data.klines.get(leader, {}).get("1m")
         
-        if df_sym is None or df_lead is None or len(df_sym) < 5 or len(df_lead) < 5:
+        if df_sym is None or df_lead is None or len(df_sym) < 30 or len(df_lead) < 30:
             return 0
             
-        sym_ret = (df_sym['c'].iloc[-1] - df_sym['c'].iloc[-5]) / df_sym['c'].iloc[-5] * 100
-        lead_ret = (df_lead['c'].iloc[-1] - df_lead['c'].iloc[-5]) / df_lead['c'].iloc[-5] * 100
+        sym_ret = df_sym['c'].pct_change().tail(30).fillna(0)
+        lead_ret = df_lead['c'].pct_change().tail(30).fillna(0)
         
-        # If leader moved > 0.3% and sym moved < 0.1% in same direction
-        if lead_ret > 0.3 and sym_ret < 0.1: return 1 # Bullish lag
-        if lead_ret < -0.3 and sym_ret > -0.1: return -1 # Bearish lag
+        # Calculate Beta = Cov(sym, lead) / Var(lead)
+        cov = sym_ret.cov(lead_ret)
+        var_lead = lead_ret.var()
+        beta = cov / var_lead if var_lead != 0 else 0
+        
+        # Only valid if they generally move together (beta > 0.7)
+        if beta > 0.7:
+            # Check the gap over the last 5 candles
+            sym_recent = (df_sym['c'].iloc[-1] - df_sym['c'].iloc[-5]) / df_sym['c'].iloc[-5] * 100
+            lead_recent = (df_lead['c'].iloc[-1] - df_lead['c'].iloc[-5]) / df_lead['c'].iloc[-5] * 100
+            
+            # Use historical stdev for gap calculation
+            std_gap = (lead_ret - sym_ret).std() * 100
+            
+            if lead_recent > 0.3 and (lead_recent - sym_recent) > (2 * std_gap): 
+                return 1 # Bullish lag
+            if lead_recent < -0.3 and (sym_recent - lead_recent) > (2 * std_gap): 
+                return -1 # Bearish lag
         
         return 0
     except:

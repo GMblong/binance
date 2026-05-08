@@ -234,12 +234,26 @@ async def manage_limit_orders(client, all_signals):
     except Exception as e:
         log_error(f"Manage Limit Orders Exception: {str(e)}")
 
+last_exit_check = {}
+
 async def check_and_execute_exits(client, symbol, current_price, all_signals=[]):
     """
     Fast Execution Engine: Checks SL/TP/Trailing/Reversal for a single symbol.
     Triggered by WebSocket or Main Loop.
     """
+    global last_exit_check
+    import time
+    now = time.time()
+    
+    # Throttle (C6): Max 1 check per second per symbol
+    if now - last_exit_check.get(symbol, 0) < 1.0:
+        return False
+    last_exit_check[symbol] = now
+    
     try:
+        ai = bot_state["trades"].get(symbol, {})
+        if not ai or ai.get("exit_pending"): return False
+        
         # Get position details from local state for speed
         pos = next((p for p in bot_state.get("active_positions", []) if p['symbol'] == symbol), None)
         if not pos: return False
@@ -248,9 +262,6 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
         amt = float(pos['positionAmt'])
         pnl_pct = ((current_price - entry_price) / entry_price) * 100 * (1 if side == "LONG" else -1)
-        
-        ai = bot_state["trades"].get(symbol, {})
-        if not ai: return False
         
         # Update Peak for Trailing Stop
         if side == "LONG": ai["peak"] = max(ai.get("peak", current_price), current_price)
@@ -314,6 +325,7 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
                         else: reason = "SMART-TP (MOMENTUM DEAD)"
 
         if reason:
+            ai["exit_pending"] = True
             return await close_position_async(client, symbol, side, amt, reason, pnl_pct)
         return False
     except Exception as e:

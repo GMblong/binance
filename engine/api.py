@@ -8,6 +8,11 @@ from utils.helpers import get_signature
 from utils.logger import log_error
 
 async def binance_request(client, method, endpoint, params=None):
+    if bot_state.get("api_health_status") == "BLOCKED":
+        return None # Circuit breaker active
+        
+    bot_state["api_req_count"] = bot_state.get("api_req_count", 0) + 1
+    
     params = params or {}
     params['timestamp'] = int(time.time() * 1000)
     query_string = urllib.parse.urlencode(params)
@@ -28,13 +33,16 @@ async def binance_request(client, method, endpoint, params=None):
             if res.status_code == 200:
                 return res
             elif res.status_code == 429:
+                bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                 bot_state["last_log"] = "[bold red]RATE LIMIT (429)[/]"
                 await asyncio.sleep(min(30, 5 * (attempt + 1)))
             elif res.status_code == 418:
+                bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                 bot_state["last_log"] = "[bold white on red] HARD BAN (418) - STOPPING 5 MIN [/]"
                 await asyncio.sleep(300)
                 return None
             elif res.status_code >= 500:
+                bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                 raise httpx.HTTPStatusError(f"Server Error {res.status_code}", request=None, response=res)
             else:
                 if res.status_code == 400:
@@ -42,14 +50,18 @@ async def binance_request(client, method, endpoint, params=None):
                         err_data = res.json()
                         if err_data.get("code") == -4130:
                             return res # Silent return for existing SL/TP
+                        bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
                     except:
+                        bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
                 else:
+                    bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                     log_error(f"API Error {res.status_code} for {endpoint}", include_traceback=False)
                 return res
         except (httpx.RequestError, httpx.HTTPStatusError) as e:
             if attempt == 2: 
+                bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                 log_error(f"API Request Final Fail ({endpoint}): {str(e)}")
                 return None 
             await asyncio.sleep(2 * (attempt + 1))
@@ -140,11 +152,19 @@ async def get_market_depth_data(client, symbols):
                 if s in symbols:
                     market_data.funding[s] = float(item['lastFundingRate'])
         
-        # Fetch Open Interest for top symbols
-        for s in symbols:
-            res_oi = await client.get(f"{API_URL}/fapi/v1/openInterest", params={"symbol": s})
-            if res_oi.status_code == 200:
-                market_data.oi[s] = float(res_oi.json()['openInterest'])
+        # Fetch Open Interest concurrently (C7)
+        sem = asyncio.Semaphore(5)
+        async def fetch_oi(s):
+            async with sem:
+                try:
+                    res_oi = await client.get(f"{API_URL}/fapi/v1/openInterest", params={"symbol": s})
+                    if res_oi.status_code == 200:
+                        market_data.oi[s] = float(res_oi.json()['openInterest'])
+                except: pass
+                
+        tasks = [fetch_oi(s) for s in symbols]
+        if tasks:
+            await asyncio.gather(*tasks)
     except: pass
 
 last_imbalance_fetch = {}

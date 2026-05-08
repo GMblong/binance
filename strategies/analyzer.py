@@ -121,20 +121,39 @@ class MarketAnalyzer:
 
     @staticmethod
     def detect_structure(df):
-        if len(df) < 10: return "CHOP", False, None, None
+        if len(df) < 15: return "CHOP", False, None, None
         try:
-            # Enhanced Structure with exact Swing High/Low levels
-            h = df['h'].tail(5)
-            l = df['l'].tail(5)
-            
+            # Multi-candle structure detection (H10) using Rolling Max/Min (Fractals)
             # Find the actual swing points in the recent window
             recent_high = df['h'].tail(15).max()
             recent_low = df['l'].tail(15).min()
             
+            # Simple fractal detection (lookback 2, lookforward 2)
+            highs = df['h'].values
+            lows = df['l'].values
+            
+            pivot_highs = []
+            pivot_lows = []
+            for i in range(2, len(df)-2):
+                if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
+                    pivot_highs.append(highs[i])
+                if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
+                    pivot_lows.append(lows[i])
+                    
+            if len(pivot_highs) >= 2 and len(pivot_lows) >= 2:
+                if pivot_highs[-1] > pivot_highs[-2] and pivot_lows[-1] > pivot_lows[-2]:
+                    return "BULLISH", False, recent_high, recent_low
+                if pivot_highs[-1] < pivot_highs[-2] and pivot_lows[-1] < pivot_lows[-2]:
+                    return "BEARISH", False, recent_high, recent_low
+                    
+            # Fallback to simple momentum if no clear pivots
+            h = df['h'].tail(5)
+            l = df['l'].tail(5)
             if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]: 
                 return "BULLISH", False, recent_high, recent_low
             if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]: 
                 return "BEARISH", False, recent_high, recent_low
+                
             return "CHOP", False, recent_high, recent_low
         except: return "CHOP", False, None, None
 
@@ -144,14 +163,26 @@ class MarketAnalyzer:
             score = 0
             nw = neural_weights or {}
             
-            # 1. Macro Trend Alignment (15m) - CRITICAL
+            # 1. Macro Trend Alignment (15m) & Soft Mean Reversion (H1)
             ema9_15 = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
             ema21_15 = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
             dir_15 = 1 if ema9_15 > ema21_15 else -1
+            
+            rsi_15m = MarketAnalyzer.get_rsi(d15m["c"], 14).iloc[-1]
+            
             if direction == dir_15: 
                 score += 30 # Heavy weight for macro alignment
             else:
-                return 0 # Do not trade against the 15m trend
+                # Soft alignment: Allow mean reversion if ranging and RSI extreme
+                if regime == "RANGING":
+                    vsa_sig = MarketAnalyzer.detect_vsa_signals(d1m)
+                    # Counter-trend valid only if RSI is extreme OR there's a strong VSA reversal signal
+                    if (direction == 1 and rsi_15m < 35) or (direction == -1 and rsi_15m > 65) or vsa_sig == direction:
+                        score -= 15 # Mild penalty, but allowed to trade (Mean Reversion)
+                    else:
+                        return 0
+                else:
+                    return 0 # Still strict in trending/volatile markets
                 
             # 2. Micro Momentum (1m)
             ema9 = MarketAnalyzer.get_ema(d1m["c"], 9).iloc[-1]
@@ -294,7 +325,27 @@ class MarketAnalyzer:
         return None
 
     @staticmethod
-    def predict_liquidation_clusters(df): return None
+    def predict_liquidation_clusters(df):
+        """Estimates liquidation clusters based on recent price extremes and common leverage tiers (M2)."""
+        try:
+            if len(df) < 30: return None
+            # Find major swings
+            recent_high = df['h'].tail(30).max()
+            recent_low = df['l'].tail(30).min()
+            
+            tiers = [25, 50] # 4% and 2% leverage bands
+            
+            clusters = {"short_liq": [], "long_liq": []}
+            
+            for lev in tiers:
+                margin = 1.0 / lev
+                # Late longs entering at recent high get liquidated if price drops
+                clusters["long_liq"].append(recent_high * (1 - margin))
+                # Late shorts entering at recent low get liquidated if price spikes
+                clusters["short_liq"].append(recent_low * (1 + margin))
+                
+            return clusters
+        except: return None
     
     @staticmethod
     def detect_volatility_breakout(df):
