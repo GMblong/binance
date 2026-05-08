@@ -26,9 +26,25 @@ class V2Predictor:
         self.models: Dict[str, Any] = bundle.get("models", {}) or {}
         self.sym_id_map: Dict[str, int] = bundle.get("sym_id_map", {}) or {}
         self.metrics: Dict[str, Any] = bundle.get("metrics", {}) or {}
+        # Extract per-regime AUC so callers can weight ML dynamically.
+        self.regime_auc: Dict[str, float] = {}
+        for reg, m in self.metrics.get("per_regime", {}).items():
+            aucs = (m or {}).get("fold_auc", [])
+            if aucs:
+                self.regime_auc[reg] = float(sum(aucs) / len(aucs))
 
     def is_ready(self) -> bool:
         return bool(self.models)
+
+    def best_auc(self) -> float:
+        """Best CV-fold AUC across regimes (useful for fusion weight)."""
+        if not self.regime_auc:
+            return 0.5
+        return max(self.regime_auc.values())
+
+    def last_regime_auc(self, regime: str) -> float:
+        """AUC for a specific regime (0.5 if not available)."""
+        return float(self.regime_auc.get(regime, 0.5))
 
     def predict_prob(
         self,

@@ -26,11 +26,22 @@ REGIMES = ("TRENDING", "VOLATILE", "RANGING")
 
 
 def _regime_of(atr_pct: float, dist_ema21: float) -> str:
+    """Regime bucketing for routing pooled model inference.
+
+    Thresholds deliberately looser than the v1 defaults: observed in real
+    training runs that atr>1.5 & dist>0.5% only captured ~2k samples of
+    TRENDING out of 50k, starving the model. New bands push more bars
+    into TRENDING so LightGBM can learn a usable edge there.
+
+      VOLATILE = atr_pct >= 1.2%                  (actual chop/news spike)
+      TRENDING = atr_pct >= 0.20% AND |dist|>=0.15% (persistent directional)
+      RANGING  = everything else
+    """
     if not np.isfinite(atr_pct) or not np.isfinite(dist_ema21):
         return "RANGING"
-    if atr_pct > 1.5:
+    if atr_pct > 1.2:
         return "VOLATILE"
-    if abs(dist_ema21) > 0.005 and atr_pct > 0.35:
+    if atr_pct > 0.20 and abs(dist_ema21) > 0.0015:
         return "TRENDING"
     return "RANGING"
 
@@ -54,11 +65,17 @@ def train_pooled(
     cross_section: Optional[pd.DataFrame] = None,
     pt_atr_mult: float = 1.5,
     sl_atr_mult: float = 1.0,
-    horizon: int = 15,
+    horizon: int = 30,
     n_splits: int = 5,
     embargo: int = 30,
 ) -> Dict[str, Any]:
     """Train one model per regime on the pooled corpus.
+
+    `horizon` default is 30 minutes (was 15). Rationale: in live runs the
+    EventDrivenBacktester sees average hold = 100-130 bars; the 15m
+    triple-barrier was therefore labelling too much chop as TIMEOUT and
+    starving the directional classes. 30m aligns the training label
+    horizon closer to actual exit distributions.
 
     Returns a dict: `{"models": {regime: model}, "sym_id_map": {...},
     "metrics": {...}}`.

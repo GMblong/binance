@@ -120,6 +120,7 @@ def make_signal_fn_v2(
             btc_close_slice = btc_1m["c"].iloc[: idx + 1]
         funding_series = funding_per_symbol.get(symbol)
         p_ml_up = 0.5
+        ml_regime_auc = 0.5
         if v2_predictor is not None and v2_predictor.is_ready():
             try:
                 p_ml_up = v2_predictor.predict_prob(
@@ -129,6 +130,13 @@ def make_signal_fn_v2(
                     funding_series=funding_series,
                     cross_section=cross_section,
                 )
+                # Per-regime AUC: if this regime's model is < 0.51 AUC,
+                # treat its output as random (P_ml = 0.5). This prevents
+                # a weak-regime model from dragging a good tech+flow
+                # signal into a bad trade.
+                ml_regime_auc = v2_predictor.last_regime_auc(regime)
+                if ml_regime_auc < 0.51:
+                    p_ml_up = 0.5
             except Exception:
                 p_ml_up = 0.5
         p_ml = p_ml_up if direction == 1 else (1.0 - p_ml_up)
@@ -311,6 +319,7 @@ def make_signal_fn_v2(
                 "p_trade": p_trade,
                 "ev_pct": ev_pct,
                 "regime": regime,
+                "ml_regime_auc": ml_regime_auc,
                 "cvd_div": cvd_div,
                 "cvd_abs": cvd_abs,
                 "funding_sig": funding_sig,

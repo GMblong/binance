@@ -217,6 +217,35 @@ async def run_v2(
                             f"  [dim]regime={reg}: n={m.get('n')} "
                             f"(CV folds not scored)[/dim]"
                         )
+            # AUC-aware fusion weight. Classifier edge is measured by the
+            # best regime AUC: AUC <= 0.51 => ML is noise, weight = 0; AUC
+            # in [0.51, 0.55] => linear ramp; AUC >= 0.55 => full weight.
+            # A model with AUC 0.49 is actively HARMFUL (polarity inverted
+            # vs real outcome) so we also clamp to zero on anything below
+            # 0.51. This was the main reason the 14-day run turned -$2.04
+            # compared to the 7-day run: TRENDING regime flipped from
+            # 0.511 to 0.491 AUC and was pulling trades the wrong way.
+            if fusion_weights is not None:
+                fusion_weights = dict(fusion_weights)
+                best_auc = predictor.best_auc()
+                if best_auc < 0.51:
+                    fusion_weights["ml"] = 0.0
+                    console.print(
+                        f"  [yellow]Best AUC {best_auc:.3f} < 0.51 -> ML weight set to 0 "
+                        f"(ML edge too weak to use; tech+flow only)[/]"
+                    )
+                elif best_auc < 0.55:
+                    scale = (best_auc - 0.51) / 0.04
+                    fusion_weights["ml"] = fusion_weights["ml"] * scale
+                    console.print(
+                        f"  [dim]Best AUC {best_auc:.3f} -> ML weight scaled to "
+                        f"{fusion_weights['ml']:.2f}[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"  [green]Best AUC {best_auc:.3f} -> ML weight "
+                        f"{fusion_weights['ml']:.2f} (full)[/]"
+                    )
 
         # -------- Simulation data (AFTER train_end_ms) --------
         console.print("[dim]Fetching simulation window data...[/dim]")
