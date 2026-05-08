@@ -22,6 +22,11 @@ class CostModel:
         becomes slippage_floor + slippage_atr_coef * 0.01.
     funding_per_8h_default: fallback funding rate in decimal (0.0001 = 0.01%).
         The engine can override per bar when historical funding is available.
+    maker_tp: if True, the engine will treat TP exits as maker limit fills
+        (fee_maker, no slippage) instead of taker market. This halves the
+        round-trip cost of a profit-taking trade. Only safe when TP is
+        placed as a resting LIMIT order (Binance futures supports this
+        via the reduce-only flag + GTC limit). SL stays taker+slip always.
     """
 
     fee_taker: float = 0.0004
@@ -29,6 +34,7 @@ class CostModel:
     slippage_floor_pct: float = 0.0003  # 0.03%
     slippage_atr_coef: float = 0.30
     funding_per_8h_default: float = 0.0001
+    maker_tp: bool = False
 
     def market_entry_cost(self, notional: float, atr_pct: float) -> float:
         """Dollar cost to enter with a MARKET order (fee + slippage)."""
@@ -42,6 +48,14 @@ class CostModel:
 
     def limit_entry_cost(self, notional: float) -> float:
         """Dollar cost to enter with a maker LIMIT order (fee only, no slip)."""
+        return notional * self.fee_maker
+
+    def limit_exit_cost(self, notional: float) -> float:
+        """Dollar cost to exit with a maker LIMIT order (fee only, no slip).
+
+        Only used by the engine for TP-as-maker fills when
+        `CostModel.maker_tp=True`. SL exits always use stop_exit_cost.
+        """
         return notional * self.fee_maker
 
     def stop_exit_cost(self, notional: float, atr_pct: float) -> float:

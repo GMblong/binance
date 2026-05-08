@@ -92,6 +92,7 @@ class EventDrivenBacktester:
         sim_bars: int = 1440,
         signal_every_n_bars: int = 5,
         exit_override: Optional[Callable[[Position, Dict[str, Any]], Optional[str]]] = None,
+        on_trade_close: Optional[Callable[[Trade, Dict[str, Any]], None]] = None,
     ) -> None:
         self.data = data
         self.signal_fn = signal_fn
@@ -103,6 +104,10 @@ class EventDrivenBacktester:
         self.sim_bars = sim_bars
         self.signal_every_n_bars = max(1, signal_every_n_bars)
         self.exit_override = exit_override
+        # Optional hook: called once per trade as soon as the position
+        # closes. Receives (Trade, position.meta). Used by v3 runners to
+        # feed the OnlineLearner its per-trade labels.
+        self.on_trade_close = on_trade_close
 
         self.pending: List[Order] = []
         self.positions: List[Position] = []
@@ -401,10 +406,17 @@ class EventDrivenBacktester:
         step: int,
         reason: str,
     ) -> None:
-        # Stops and trailing exits are market-executed (taker + slip). TP on a
-        # GTC limit could be maker-filled, but to be conservative we charge
-        # taker here as well.
-        exit_fee = self.cost.market_exit_cost(pos.size_usd, atr_pct)
+        # Exit routing by reason:
+        #   - TP: can be a resting maker limit (reduce-only GTC on Binance).
+        #         When `CostModel.maker_tp=True`, charge maker fee + 0 slip.
+        #   - SL: always stop_market -> taker fee + slippage.
+        #   - TRAIL/EOD/custom: taker fee + slippage (dynamic close).
+        if reason == "TP" and getattr(self.cost, "maker_tp", False):
+            exit_fee = self.cost.limit_exit_cost(pos.size_usd)
+        elif reason == "SL":
+            exit_fee = self.cost.stop_exit_cost(pos.size_usd, atr_pct)
+        else:
+            exit_fee = self.cost.market_exit_cost(pos.size_usd, atr_pct)
         gross = (
             (exit_price - pos.entry) / pos.entry
             if pos.side == "LONG"
@@ -427,6 +439,15 @@ class EventDrivenBacktester:
                 reason=reason,
             )
         )
+        # Fire the close hook BEFORE removing the position so the
+        # callback can still see pos.meta (e.g. the sig_id that links
+        # back to the OnlineLearner's pending sample).
+        if self.on_trade_close is not None:
+            try:
+                self.on_trade_close(self.trades[-1], dict(pos.meta))
+            except Exception:
+                # Never let a hook failure kill the sim loop.
+                pass
         self.positions.remove(pos)
 
     def _force_close_all(self) -> None:
