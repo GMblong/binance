@@ -786,6 +786,64 @@ class MarketAnalyzer:
         except: return False
 
     @staticmethod
+    def fractal_dimension(df, n: int = 30) -> float:
+        """Higuchi fractal dimension of price series.
+        D ≈ 1.0 = smooth trend, D ≈ 1.5 = random walk, D ≈ 2.0 = choppy/noisy.
+        Use to filter: only trade when D < 1.4 (structured market)."""
+        try:
+            if len(df) < n:
+                return 1.5
+            prices = df['c'].values[-n:].astype(np.float64)
+            k_max = min(8, n // 4)
+            lk = []
+            for k in range(1, k_max + 1):
+                lengths = []
+                for m in range(1, k + 1):
+                    idx = np.arange(m - 1, n, k)
+                    if len(idx) < 2:
+                        continue
+                    seg = prices[idx]
+                    L = np.sum(np.abs(np.diff(seg))) * (n - 1) / (k * len(np.diff(seg)) * k)
+                    lengths.append(L)
+                if lengths:
+                    lk.append((np.log(1.0 / k), np.log(np.mean(lengths) + 1e-12)))
+            if len(lk) < 3:
+                return 1.5
+            x = np.array([p[0] for p in lk])
+            y = np.array([p[1] for p in lk])
+            slope = np.polyfit(x, y, 1)[0]
+            return float(max(1.0, min(2.0, slope)))
+        except:
+            return 1.5
+
+    @staticmethod
+    def variance_ratio_test(df, period: int = 5) -> float:
+        """Lo-MacKinlay variance ratio test.
+        VR ≈ 1.0 = random walk (no edge).
+        VR > 1.0 = trending/momentum.
+        VR < 1.0 = mean-reverting.
+        Returns VR value."""
+        try:
+            if len(df) < period * 4:
+                return 1.0
+            prices = df['c'].values.astype(np.float64)
+            log_ret = np.diff(np.log(prices + 1e-12))
+            n = len(log_ret)
+            if n < period * 2:
+                return 1.0
+            # Variance of 1-period returns
+            var1 = np.var(log_ret, ddof=1)
+            # Variance of k-period returns
+            k_ret = log_ret[:(n // period) * period].reshape(-1, period).sum(axis=1)
+            var_k = np.var(k_ret, ddof=1)
+            if var1 == 0:
+                return 1.0
+            vr = var_k / (period * var1)
+            return float(vr)
+        except:
+            return 1.0
+
+    @staticmethod
     def detect_sweep(df): return False
     
     @staticmethod

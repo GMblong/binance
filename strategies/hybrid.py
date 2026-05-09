@@ -12,6 +12,7 @@ from utils.logger import log_error
 from engine.multi_exchange import aggregate_flow
 from engine.depth_predictor import depth_predictor
 from engine.sentiment import sentiment_filter
+from engine.microstructure import micro_engine
 
 api_sem = asyncio.Semaphore(15)  # Higher concurrency for parallel analysis
 busy_symbols = set()
@@ -283,6 +284,23 @@ async def analyze_hybrid_async(client, symbol):
             score = min(score + 5, 100)  # Both say mean-revert
             active_features.append(f"{regime}:hmm")
         
+        # --- FRACTAL DIMENSION & VARIANCE RATIO (Market Quality Filter) ---
+        fd = MarketAnalyzer.fractal_dimension(d1m, n=50)
+        vr = MarketAnalyzer.variance_ratio_test(d15m, period=5)
+        # Only trade structured markets (FD < 1.5 = not pure noise)
+        if fd > 1.6:
+            score = int(score * 0.6)  # Heavy penalty: market is noise/chop
+        elif fd < 1.3:
+            score = min(score + 5, 100)  # Clean structure
+            active_features.append(f"{regime}:fractal")
+        # VR confirms regime: >1 = momentum, <1 = mean-revert
+        if regime == "TRENDING" and vr > 1.2:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:var_ratio")
+        elif regime == "RANGING" and vr < 0.8:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:var_ratio")
+        
         # --- ICEBERG ORDER DETECTION ---
         iceberg_bid, iceberg_ask = market_data.detect_iceberg(symbol)
         if direction == 1 and iceberg_bid:
@@ -336,6 +354,74 @@ async def analyze_hybrid_async(client, symbol):
             score = min(score + 5, 100)  # Liquidation cascade in our direction
             active_features.append(f"{regime}:liq_cascade")
         
+        # --- MICROSTRUCTURE ALPHA ENGINE (Superhuman Signals) ---
+        micro = micro_engine.compute(symbol, window_sec=60)
+        
+        # VPIN: smart money detected (>0.6 = informed trading active)
+        if micro["vpin"] > 0.6:
+            # High VPIN + OFI alignment = strong institutional flow
+            if (direction == 1 and micro["ofi"] > 0.2) or (direction == -1 and micro["ofi"] < -0.2):
+                score = min(score + 12, 100)
+                active_features.append(f"{regime}:vpin")
+            elif (direction == 1 and micro["ofi"] < -0.2) or (direction == -1 and micro["ofi"] > 0.2):
+                score = max(score - 15, 0)  # Informed flow AGAINST us
+
+        # Hurst: trend persistence confirmation
+        if micro["hurst"] > 0.6 and regime == "TRENDING":
+            score = min(score + 8, 100)  # Trend is persistent (not random)
+            active_features.append(f"{regime}:hurst")
+        elif micro["hurst"] < 0.4 and regime == "RANGING":
+            score = min(score + 5, 100)  # Mean-reverting confirmed
+            active_features.append(f"{regime}:hurst")
+
+        # Entropy: low entropy = predictable (good for us)
+        if micro["entropy"] < 0.6:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:entropy")
+
+        # Microprice skew: fair value directional bias
+        if (direction == 1 and micro["microprice_skew"] > 0.3) or \
+           (direction == -1 and micro["microprice_skew"] < -0.3):
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:microprice")
+        elif (direction == 1 and micro["microprice_skew"] < -0.4) or \
+             (direction == -1 and micro["microprice_skew"] > 0.4):
+            score = max(score - 10, 0)  # Fair value against us
+
+        # Absorption: whale accumulating silently
+        if micro["absorption"] > 0.7:
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:absorption")
+
+        # Whale prints: large outlier trades in our direction
+        if micro["whale_prints"] >= 2 and abs(micro["ofi"]) > 0.15:
+            if (direction == 1 and micro["ofi"] > 0) or (direction == -1 and micro["ofi"] < 0):
+                score = min(score + 10, 100)
+                active_features.append(f"{regime}:whale")
+
+        # Quote stuffing: if high, treat as manipulation (fake move)
+        if micro["quote_stuffing"] > 0.7:
+            is_fake_move = True
+
+        # Hawkes intensity: burst of activity = momentum building
+        if micro["hawkes_intensity"] > 0.6:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:hawkes")
+
+        # Vol compression: coiled spring about to explode
+        if micro["vol_compression"] > 0.7:
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:vol_compress")
+
+        # Higher-order stats: tail risk / distribution shift
+        if direction == 1 and micro["skewness"] > 0.5:
+            score = min(score + 5, 100)  # Positive skew = upside potential
+        elif direction == -1 and micro["skewness"] < -0.5:
+            score = min(score + 5, 100)  # Negative skew = downside potential
+        if micro["kurtosis"] > 5.0:
+            # Fat tails = extreme move likely, tighten SL later
+            pass
+
         # 2. Smart limit price placement
         # Priority: Order Block > FVG > VWAP-area > EMA21 pullback
         vwap_price = None
@@ -395,6 +481,10 @@ async def analyze_hybrid_async(client, symbol):
             sl_pct *= 0.85  # High confidence = tighter SL (less risk per trade)
         elif 0.45 < ml_prob < 0.55:
             sl_pct *= 1.15  # Uncertain = wider SL (give room)
+        
+        # Fat-tail protection: widen SL when kurtosis is extreme (distribution has fat tails)
+        if micro["kurtosis"] > 5.0:
+            sl_pct *= 1.1
         
         sl_pct = max(0.4, min(sl_pct, 3.5))
         

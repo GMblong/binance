@@ -58,8 +58,8 @@ async def trading_loop(client):
         market_data.tickers = tkr
         for t in tkr: market_data.prices[t["s"]] = t["c"]
         last_ticker_refresh = time.time()
-        # Pre-train top 5 coins by volume
-        top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:5]
+        # Pre-train top 15 coins by volume
+        top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:15]
         pretrain_symbols = [t["s"] for t in top_by_vol]
         asyncio.create_task(ml_predictor.batch_pretrain(client, pretrain_symbols))
         bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(pretrain_symbols)} models...[/]"
@@ -176,6 +176,12 @@ async def trading_loop(client):
             # Depth predictor observation (label walls for training)
             for s in scan_targets[:10]:
                 depth_predictor.observe_and_label(s)
+            
+            # Aggressive ML training: train any scan target that has no model yet
+            if loop_count % 10 == 1:
+                untrained = [s for s in scan_targets if s not in ml_predictor.models and s not in ml_predictor._retraining]
+                if untrained:
+                    asyncio.create_task(ml_predictor.batch_pretrain(client, untrained[:6]))
             
             # Fetch institutional data (OI & Funding) periodically (Setiap ~30 detik untuk menghemat rate limit)
             if loop_count % 20 == 0:
@@ -329,7 +335,7 @@ async def main():
         
         ui_queue = asyncio.Queue()
 
-        with Live(None, refresh_per_second=4, screen=False) as live:
+        with Live(None, refresh_per_second=4, screen=True) as live:
             async def handle_keys():
                 def get_char():
                     if not os.isatty(sys.stdin.fileno()):

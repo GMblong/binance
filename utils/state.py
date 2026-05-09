@@ -64,18 +64,54 @@ class MarketData:
         # Each entry: (timestamp_sec, signed_quote_volume)
         # signed = +qty*price if aggressive BUY (m=False), -qty*price if aggressive SELL (m=True)
         self.cvd_buf = {}  # {symbol: deque[(ts, signed_qvol)]}
+        # Tick-level trade buffer (richer than cvd_buf) for microstructure alpha:
+        # (ts, price, qty, sign) where sign=+1 aggressive BUY, -1 aggressive SELL
+        self.tick_buf = {}  # {symbol: deque[(ts, price, qty, sign)]}
         # Orderflow microstructure: depth snapshots for velocity & spoofing detection
         self.depth_history = {}  # {symbol: deque[(ts, bid_total, ask_total, top_bid_qty, top_ask_qty)]}
+        # Best bid/ask + sizes for microprice (weighted fair value)
+        self.best_quote = {}  # {symbol: (ts, best_bid, best_bid_qty, best_ask, best_ask_qty)}
+        # Microstructure alpha cache (computed periodically, read by strategy)
+        self.micro_alpha = {}  # {symbol: {features_dict, ts}}
         self.lock = asyncio.Lock()
 
     def push_agg_trade(self, symbol: str, ts_sec: float, qty: float, price: float, is_buyer_maker: bool, max_keep: int = 600):
-        """Append a signed quote-volume delta from an aggTrade event."""
+        """Append a signed quote-volume delta from an aggTrade event.
+
+        Also populates tick_buf (richer info: price + qty + sign) used by the
+        microstructure alpha engine (VPIN, Kyle's lambda, whale prints, etc.).
+        """
         buf = self.cvd_buf.get(symbol)
         if buf is None:
             buf = deque(maxlen=max_keep)
             self.cvd_buf[symbol] = buf
-        signed = qty * price * (-1.0 if is_buyer_maker else 1.0)
+        sign = -1.0 if is_buyer_maker else 1.0
+        signed = qty * price * sign
         buf.append((ts_sec, signed))
+
+        # Tick-level buffer for microstructure calculations
+        tbuf = self.tick_buf.get(symbol)
+        if tbuf is None:
+            tbuf = deque(maxlen=max_keep * 3)  # keep more ticks (~1800)
+            self.tick_buf[symbol] = tbuf
+        tbuf.append((ts_sec, price, qty, sign))
+
+    def get_trades(self, symbol: str, window_sec: int = 60, max_items: int = 600):
+        """Return list of tick-level trades in window: [(ts, price, qty, sign), ...]
+
+        Most-recent-first iteration is converted to chronological order.
+        """
+        buf = self.tick_buf.get(symbol)
+        if not buf:
+            return []
+        cutoff = time.time() - window_sec
+        out = []
+        for row in reversed(buf):
+            if row[0] < cutoff or len(out) >= max_items:
+                break
+            out.append(row)
+        out.reverse()
+        return out
 
     def get_live_cvd(self, symbol: str, window_sec: int = 60):
         """Return (cvd_sum_usd, n_trades) over the last `window_sec` seconds."""
@@ -99,6 +135,26 @@ class MarketData:
             buf = deque(maxlen=60)
             self.depth_history[symbol] = buf
         buf.append((time.time(), bid_total, ask_total, top_bid_qty, top_ask_qty))
+
+    def push_best_quote(self, symbol: str, best_bid: float, best_bid_qty: float,
+                        best_ask: float, best_ask_qty: float):
+        """Store best bid/ask + sizes for microprice calculation."""
+        self.best_quote[symbol] = (time.time(), best_bid, best_bid_qty, best_ask, best_ask_qty)
+
+    def get_microprice(self, symbol: str):
+        """Size-weighted fair value: microprice = (bid*ask_qty + ask*bid_qty) / (bid_qty + ask_qty).
+
+        More predictive than mid-price because it reflects the side with LESS
+        liquidity (where price is likely to move next).
+        Returns None if no recent quote.
+        """
+        q = self.best_quote.get(symbol)
+        if not q:
+            return None
+        ts, bb, bbq, ba, baq = q
+        if time.time() - ts > 5.0 or (bbq + baq) <= 0 or bb <= 0 or ba <= 0:
+            return None
+        return (bb * baq + ba * bbq) / (bbq + baq)
 
     def get_depth_velocity(self, symbol: str, window_sec: int = 10):
         """Calculate rate of change in orderbook depth.

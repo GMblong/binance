@@ -25,7 +25,7 @@ class MLPredictor:
         self.performance = {}
         self.feature_importance = {}
         self.feature_cache = {}
-        self.retrain_sem = asyncio.Semaphore(2)
+        self.retrain_sem = asyncio.Semaphore(4)
         self.startup_done = False
         self._retraining = set()
         self.trades_since_train = {}
@@ -79,7 +79,12 @@ class MLPredictor:
             finally:
                 self._retraining.discard(symbol)
 
-        asyncio.create_task(_go())
+        # First-time training: await directly so next cycle gets real prediction
+        # Re-training existing model: background task
+        if symbol not in self.models:
+            asyncio.create_task(_go())
+        else:
+            asyncio.create_task(_go())
         return True
 
     def _get_feature_list(self, df_cols):
@@ -257,12 +262,12 @@ class MLPredictor:
         return df
 
     async def train_model(self, client, symbol, end_time=None):
-        df = await self.fetch_extended_data(client, symbol, interval="1m", total=1500)
+        df = await self.fetch_extended_data(client, symbol, interval="1m", total=500)
         lookahead = 15
-        if df is None or len(df) < 500:
-            df = await self.fetch_extended_data(client, symbol, interval="15m", total=1500)
+        if df is None or len(df) < 200:
+            df = await self.fetch_extended_data(client, symbol, interval="15m", total=500)
             lookahead = 10
-            if df is None or len(df) < 300:
+            if df is None or len(df) < 100:
                 return False
 
         df = await self._inject_funding_oi(client, symbol, df)
@@ -270,13 +275,13 @@ class MLPredictor:
         def _train_sync():
             df_sync = self.feature_engineering(df.copy())
             df_sync = self.apply_triple_barrier(df_sync, pt_mult=1.5, sl_mult=1.2, lookahead=lookahead)
-            if len(df_sync) < 100:
+            if len(df_sync) < 60:
                 return False
 
             features = self._get_feature_list(df_sync.columns)
             X, y = df_sync[features], df_sync['target']
 
-            tscv = TimeSeriesSplit(n_splits=3)
+            tscv = TimeSeriesSplit(n_splits=2)
             scores_lgb, scores_xgb, scores_mlp, scores_ens = [], [], [], []
             last_lgb, last_xgb, last_mlp, last_scaler = None, None, None, None
 
@@ -286,8 +291,8 @@ class MLPredictor:
 
                 # --- LightGBM ---
                 m_lgb = lgb.LGBMClassifier(
-                    n_estimators=150, learning_rate=0.05, max_depth=6,
-                    num_leaves=25, subsample=0.8, colsample_bytree=0.8,
+                    n_estimators=80, learning_rate=0.08, max_depth=5,
+                    num_leaves=20, subsample=0.8, colsample_bytree=0.8,
                     class_weight='balanced', n_jobs=2, verbose=-1, random_state=42
                 )
                 m_lgb.fit(X_tr, y_tr)
@@ -296,7 +301,7 @@ class MLPredictor:
 
                 # --- XGBoost ---
                 m_xgb = xgb.XGBClassifier(
-                    n_estimators=150, learning_rate=0.05, max_depth=6,
+                    n_estimators=80, learning_rate=0.08, max_depth=5,
                     subsample=0.8, colsample_bytree=0.8,
                     scale_pos_weight=(y_tr == 0).sum() / max((y_tr == 1).sum(), 1),
                     use_label_encoder=False, eval_metric='logloss',
@@ -312,7 +317,7 @@ class MLPredictor:
                 X_te_s = scaler.transform(X_te)
 
                 m_mlp = MLPClassifier(
-                    hidden_layer_sizes=(64, 32), max_iter=200,
+                    hidden_layer_sizes=(32, 16), max_iter=150,
                     learning_rate='adaptive', early_stopping=True,
                     validation_fraction=0.15, random_state=42
                 )
@@ -361,8 +366,8 @@ class MLPredictor:
                 return cached[1]
         
         if symbol not in self.models:
-            # NON-BLOCKING: Don't wait for training, return neutral and train in background
-            asyncio.create_task(self.maybe_retrain(client, symbol))
+            # Train immediately if semaphore available, else background
+            await self.maybe_retrain(client, symbol)
             return 0.5
         else:
             asyncio.create_task(self.maybe_retrain(client, symbol))

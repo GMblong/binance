@@ -267,10 +267,15 @@ class WebSocketManager:
                                         ask_total = sum(float(a[1]) for a in asks[:10])
                                         top_bid_qty = float(bids[0][1]) if bids else 0
                                         top_ask_qty = float(asks[0][1]) if asks else 0
+                                        top_bid_px = float(bids[0][0]) if bids else 0
+                                        top_ask_px = float(asks[0][0]) if asks else 0
                                         # Update imbalance + depth microstructure
                                         if ask_total > 0:
                                             market_data.imbalance[sym_d] = bid_total / ask_total
                                         market_data.push_depth_snapshot(sym_d, bid_total, ask_total, top_bid_qty, top_ask_qty)
+                                        # Best quote for microprice (size-weighted fair value)
+                                        if top_bid_px > 0 and top_ask_px > 0:
+                                            market_data.push_best_quote(sym_d, top_bid_px, top_bid_qty, top_ask_px, top_ask_qty)
                                     except Exception:
                                         pass
                                 elif "forceOrder" in stream_name:
