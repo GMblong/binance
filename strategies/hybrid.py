@@ -13,6 +13,7 @@ from engine.multi_exchange import aggregate_flow
 from engine.depth_predictor import depth_predictor
 from engine.sentiment import sentiment_filter
 from engine.microstructure import micro_engine
+from engine.superhuman import superhuman
 
 api_sem = asyncio.Semaphore(15)  # Higher concurrency for parallel analysis
 busy_symbols = set()
@@ -421,6 +422,76 @@ async def analyze_hybrid_async(client, symbol):
         if micro["kurtosis"] > 5.0:
             # Fat tails = extreme move likely, tighten SL later
             pass
+
+        # --- SUPERHUMAN SIGNAL DETECTION (Invisible to humans) ---
+        sh = superhuman.compute(symbol, d1m, d15m, d1h)
+
+        # Tick Imbalance Bars: informed flow detected
+        if sh["tib_signal"] == direction:
+            score = min(score + 10, 100)
+            active_features.append(f"{regime}:tib")
+        elif sh["tib_signal"] == -direction:
+            score = max(score - 8, 0)
+
+        # Flow Toxicity: smart money active before big move
+        if sh["toxicity"] > 0.7:
+            if (direction == 1 and sh["smart_money"] > 0.2) or (direction == -1 and sh["smart_money"] < -0.2):
+                score = min(score + 12, 100)
+                active_features.append(f"{regime}:toxicity")
+            elif (direction == 1 and sh["smart_money"] < -0.3) or (direction == -1 and sh["smart_money"] > 0.3):
+                score = max(score - 12, 0)
+
+        # Entropy Regime Shift: regime changing in our favor
+        if sh["entropy_shift"] > 0.3 and regime == "RANGING":
+            score = min(score + 8, 100)  # Shifting to trending = momentum opportunity
+            active_features.append(f"{regime}:entropy_shift")
+        elif sh["entropy_shift"] < -0.3 and regime == "TRENDING":
+            score = max(score - 8, 0)  # Trend dying
+
+        # Hidden Divergence: multi-TF invisible divergence
+        if sh["hidden_div"] == direction:
+            score = min(score + 10, 100)
+            active_features.append(f"{regime}:hidden_div")
+        elif sh["hidden_div"] == -direction:
+            score = max(score - 10, 0)
+
+        # Information Asymmetry: insiders trading
+        if sh["info_asymmetry"] > 0.6 and sh["tib_signal"] == direction:
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:info_asym")
+
+        # Gamma Proxy: squeeze potential
+        if direction == 1 and sh["gamma_proxy"] > 0.3:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:gamma")
+        elif direction == -1 and sh["gamma_proxy"] < -0.3:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:gamma")
+
+        # Temporal Alpha: time-based edge
+        if sh["temporal_alpha"] > 0.3:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:temporal")
+        elif sh["temporal_alpha"] < -0.3:
+            score = max(score - 5, 0)
+
+        # Autocorrelation Decay: momentum exhaustion
+        if sh["autocorr_decay"] > 0.7:
+            score = max(score - 10, 0)  # Momentum dying, don't enter
+            is_fake_move = True
+
+        # Micro Momentum Shift: tick-level trend change
+        if sh["micro_momentum"] == direction:
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:micro_shift")
+        elif sh["micro_momentum"] == -direction:
+            score = max(score - 8, 0)
+
+        # Price Discovery: Binance lagging other exchanges
+        if (direction == 1 and sh["price_discovery"] > 0.3) or \
+           (direction == -1 and sh["price_discovery"] < -0.3):
+            score = min(score + 8, 100)
+            active_features.append(f"{regime}:price_disc")
 
         # 2. Smart limit price placement
         # Priority: Order Block > FVG > VWAP-area > EMA21 pullback

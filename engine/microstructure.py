@@ -40,6 +40,9 @@ class MicrostructureEngine:
             "vol_compression": 0.0,  # Volatility compression ratio
             "skewness": 0.0,    # Return distribution skew
             "kurtosis": 3.0,    # Return distribution kurtosis (3=normal)
+            "toxic_flow_ratio": 0.0,  # Informed vs noise trader ratio
+            "informed_prob": 0.0,     # Probability trade is informed (PIN model)
+            "price_discovery_score": 0.0,  # Hasbrouck info share
         }
 
         if n < 20:
@@ -88,6 +91,15 @@ class MicrostructureEngine:
         sk, ku = self._higher_order_stats(prices)
         result["skewness"] = sk
         result["kurtosis"] = ku
+
+        # --- 13. Toxic Flow Ratio (informed vs noise) ---
+        result["toxic_flow_ratio"] = self._toxic_flow_ratio(qtys, signs, timestamps)
+
+        # --- 14. Informed Trade Probability (simplified PIN) ---
+        result["informed_prob"] = self._informed_probability(qtys, signs)
+
+        # --- 15. Price Discovery Score (Hasbrouck info share proxy) ---
+        result["price_discovery_score"] = self._price_discovery_score(symbol, prices, timestamps)
 
         self._cache[symbol] = (time.time(), result)
         market_data.micro_alpha[symbol] = result
@@ -335,6 +347,71 @@ class MicrostructureEngine:
         skew = float(np.mean(centered ** 3))
         kurt = float(np.mean(centered ** 4))
         return skew, kurt
+
+    def _toxic_flow_ratio(self, qtys: np.ndarray, signs: np.ndarray, timestamps: np.ndarray) -> float:
+        """Toxic Flow Ratio: fraction of volume from informed traders.
+        Large trades in bursts = informed. Small uniform = noise."""
+        n = len(qtys)
+        if n < 20:
+            return 0.0
+        median_q = np.median(qtys)
+        large_mask = qtys > median_q * 2
+        large_vol = qtys[large_mask].sum()
+        total_vol = qtys.sum()
+        size_ratio = large_vol / (total_vol + 1e-12)
+
+        if n >= 10:
+            iat = np.diff(timestamps)
+            iat = iat[iat > 0]
+            cv = iat.std() / (iat.mean() + 1e-12) if len(iat) > 5 else 0.0
+            burst_score = min(1.0, cv / 2.5)
+        else:
+            burst_score = 0.0
+
+        if large_mask.sum() >= 3:
+            consistency = abs(signs[large_mask].mean())
+        else:
+            consistency = 0.0
+
+        return float(min(1.0, size_ratio * 0.4 + burst_score * 0.3 + consistency * 0.3))
+
+    def _informed_probability(self, qtys: np.ndarray, signs: np.ndarray) -> float:
+        """Simplified PIN model: imbalance / (imbalance + 2*noise)."""
+        if len(qtys) < 20:
+            return 0.0
+        buy_vol = qtys[signs > 0].sum()
+        sell_vol = qtys[signs < 0].sum()
+        total = buy_vol + sell_vol
+        if total <= 0:
+            return 0.0
+        imbalance = abs(buy_vol - sell_vol)
+        noise_proxy = 2 * min(buy_vol, sell_vol)
+        return float(min(1.0, imbalance / (imbalance + noise_proxy + 1e-12)))
+
+    def _price_discovery_score(self, symbol: str, prices: np.ndarray, timestamps: np.ndarray) -> float:
+        """Hasbrouck info share proxy: does Binance lead or lag?
+        Returns [0,1] where 1 = Binance fully leads."""
+        from engine.multi_exchange import bybit_feed, okx_feed
+
+        binance_price = prices[-1] if len(prices) > 0 else 0
+        bybit_price = bybit_feed.prices.get(symbol, 0)
+        okx_price = okx_feed.prices.get(symbol, 0)
+
+        if binance_price <= 0:
+            return 0.5
+        if bybit_price <= 0 and okx_price <= 0:
+            return 0.7
+
+        divergences = []
+        if bybit_price > 0:
+            divergences.append((bybit_price - binance_price) / (binance_price + 1e-12))
+        if okx_price > 0:
+            divergences.append((okx_price - binance_price) / (binance_price + 1e-12))
+
+        avg_div = np.mean(divergences)
+        # Negative div = others lower = Binance leads
+        discovery = 0.5 - avg_div * 50
+        return float(np.clip(discovery, 0.0, 1.0))
 
 
 # Singleton
