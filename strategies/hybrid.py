@@ -9,9 +9,16 @@ from engine.ml_engine import ml_predictor
 from engine.api import get_orderbook_imbalance
 from utils.intelligence import get_current_session, detect_lead_lag, calculate_market_volatility
 from utils.logger import log_error
+from engine.multi_exchange import aggregate_flow
+from engine.depth_predictor import depth_predictor
+from engine.sentiment import sentiment_filter
 
-api_sem = asyncio.Semaphore(10) # Increased to allow true concurrency
+api_sem = asyncio.Semaphore(15)  # Higher concurrency for parallel analysis
 busy_symbols = set()
+
+# Analysis result cache - avoid re-analyzing if data hasn't changed
+_analysis_cache = {}  # {symbol: (last_kline_ot, result)}
+_indicator_cache = {}  # {(symbol, interval): (last_ot, indicators_dict)}
 
 async def get_btc_trend(client):
     try:
@@ -27,10 +34,18 @@ async def get_btc_trend(client):
 
 async def analyze_hybrid_async(client, symbol):
     if symbol in busy_symbols: 
-        return None
+        return _analysis_cache.get(symbol, (0, None))[1]
     try:
         now = time.time()
         if symbol not in market_data.klines: market_data.klines[symbol] = {}
+        
+        # Check cache - if kline data hasn't changed, return cached result
+        k = market_data.klines.get(symbol, {})
+        if "1m" in k and not k["1m"].empty:
+            last_ot = float(k["1m"].iloc[-1]['ot'])
+            cached = _analysis_cache.get(symbol)
+            if cached and cached[0] == last_ot and (now - cached[2]) < 3.0:
+                return cached[1]
         
         last_p = market_data.last_prime.get(symbol, 0)
         # Force sync if data is missing
@@ -282,7 +297,6 @@ async def analyze_hybrid_async(client, symbol):
             score = max(score - 10, 0)  # Hidden buyer blocks our short
         
         # --- MULTI-EXCHANGE DIVERGENCE (Aggregate: Binance + Bybit + OKX) ---
-        from engine.multi_exchange import aggregate_flow
         avg_div, cvd_bias = aggregate_flow.get_cross_exchange_signal(symbol)
         if direction == 1 and avg_div > 0.03:
             score = min(score + 8, 100)
@@ -299,7 +313,6 @@ async def analyze_hybrid_async(client, symbol):
             active_features.append(f"{regime}:xcvd")
         
         # --- PREDICTIVE DEPTH (Real vs Fake Wall) ---
-        from engine.depth_predictor import depth_predictor
         bid_real, ask_real = depth_predictor.predict(symbol)
         if direction == 1 and bid_real > 0.7:
             score = min(score + 5, 100)  # Real bid wall = support confirmed
@@ -313,7 +326,6 @@ async def analyze_hybrid_async(client, symbol):
             score = max(score - 8, 0)  # Real bid wall blocks our short
         
         # --- SENTIMENT FILTER ---
-        from engine.sentiment import sentiment_filter
         sentiment = sentiment_filter.get_sentiment(symbol)
         if sentiment < -0.5 and direction == 1:
             score = max(score - 20, 0)  # Bearish event, don't go long
@@ -474,7 +486,7 @@ async def analyze_hybrid_async(client, symbol):
                     limit_p = price * (1 + 0.003)  # Force 0.3% above
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
         
-        return {
+        result = {
             "sym": symbol.replace("USDT", ""), "price": f"{price:,.4f}", "limit": float(limit_p),
             "sig": signal, "score": int(score), "struct": struct[:4], "dir": int(direction), "dir_15m": int(direction),
             "regime": regime, "ai": {
@@ -485,6 +497,10 @@ async def analyze_hybrid_async(client, symbol):
                 "active_features": list(active_features),
             }
         }
+        # Cache result keyed by last kline open time
+        cache_ot = float(d1m.iloc[-1]['ot']) if not d1m.empty else 0
+        _analysis_cache[symbol] = (cache_ot, result, time.time())
+        return result
     except Exception as e:
         if symbol in busy_symbols: busy_symbols.discard(symbol)
         log_error(f"Analysis Crash ({symbol}): {str(e)}")

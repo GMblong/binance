@@ -30,6 +30,9 @@ class MLPredictor:
         self._retraining = set()
         self.trades_since_train = {}
         self.last_drift_check = {}
+        # Prediction cache: avoid re-predicting if features haven't changed
+        self._pred_cache = {}  # {symbol: (last_ot, probability)}
+        self._pred_cache_ttl = 5.0  # seconds
 
     def update_performance(self, symbol, is_win):
         if symbol not in self.performance:
@@ -104,12 +107,15 @@ class MLPredictor:
         df['MACDs_12_26_9'] = df['MACD_12_26_9'].ewm(span=9, adjust=False).mean()
         df['MACDh_12_26_9'] = df['MACD_12_26_9'] - df['MACDs_12_26_9']
 
-        df['ema_60'] = ta.ema(df['c'], length=60)
+        if is_training:
+            df['ema_60'] = ta.ema(df['c'], length=60)
 
+        # VWAP (use smaller window for prediction to reduce computation)
+        vwap_window = 100 if is_training else 60
         df['typical_price'] = (df['h'] + df['l'] + df['c']) / 3
         df['vol_price'] = df['typical_price'] * df['v']
-        df['vwap'] = df['vol_price'].rolling(window=100).sum() / df['v'].rolling(window=100).sum()
-        df['dist_vwap'] = (df['c'] - df['vwap']) / df['vwap']
+        df['vwap'] = df['vol_price'].rolling(window=vwap_window, min_periods=1).sum() / df['v'].rolling(window=vwap_window, min_periods=1).sum()
+        df['dist_vwap'] = (df['c'] - df['vwap']) / (df['vwap'] + 1e-8)
         df.drop(columns=['vol_price'], inplace=True, errors='ignore')
 
         range_diff = df['h'] - df['l'] + 1e-8
@@ -132,8 +138,8 @@ class MLPredictor:
         df['upper_wick'] = (df['h'] - df[['o', 'c']].max(axis=1)) / df['c']
         df['lower_wick'] = (df[['o', 'c']].min(axis=1) - df['l']) / df['c']
 
-        df['dist_ema9'] = (df['c'] - df['ema_9']) / df['ema_9']
-        df['dist_ema21'] = (df['c'] - df['ema_21']) / df['ema_21']
+        df['dist_ema9'] = (df['c'] - df['ema_9']) / (df['ema_9'] + 1e-8)
+        df['dist_ema21'] = (df['c'] - df['ema_21']) / (df['ema_21'] + 1e-8)
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.drop(columns=['typical_price', 'dir_vol', 'cvd'], inplace=True, errors='ignore')
@@ -347,10 +353,17 @@ class MLPredictor:
         self.startup_done = True
 
     async def predict(self, client, symbol, current_df):
+        # Check prediction cache first
+        if not current_df.empty:
+            last_ot = float(current_df.iloc[-1]['ot']) if 'ot' in current_df.columns else 0
+            cached = self._pred_cache.get(symbol)
+            if cached and cached[0] == last_ot and (time.time() - cached[2]) < self._pred_cache_ttl:
+                return cached[1]
+        
         if symbol not in self.models:
-            if not await self.train_model(client, symbol):
-                return 0.5
-            self.trades_since_train[symbol] = 0
+            # NON-BLOCKING: Don't wait for training, return neutral and train in background
+            asyncio.create_task(self.maybe_retrain(client, symbol))
+            return 0.5
         else:
             asyncio.create_task(self.maybe_retrain(client, symbol))
 
@@ -385,17 +398,20 @@ class MLPredictor:
             p_mlp = 0.5
 
         # Weighted vote: LGB 0.4, XGB 0.35, MLP 0.25
-        # Tree models get more weight (more reliable on tabular data)
         final_prob = (p_lgb * 0.4) + (p_xgb * 0.35) + (p_mlp * 0.25)
 
         # Consensus bonus: if all 3 agree strongly, boost confidence
         all_probs = [p_lgb, p_xgb, p_mlp]
-        agreement = 1.0 - np.std(all_probs) * 2  # Low std = high agreement
+        agreement = 1.0 - np.std(all_probs) * 2
         if agreement > 0.85:
-            # All models agree → push probability further from 0.5
             final_prob = 0.5 + (final_prob - 0.5) * 1.15
 
-        return max(0.0, min(1.0, final_prob))
+        result = max(0.0, min(1.0, final_prob))
+        
+        # Cache the prediction
+        last_ot = float(current_df.iloc[-1]['ot']) if not current_df.empty and 'ot' in current_df.columns else 0
+        self._pred_cache[symbol] = (last_ot, result, time.time())
+        return result
 
 
 ml_predictor = MLPredictor()

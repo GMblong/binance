@@ -9,7 +9,17 @@ from utils.state import bot_state, market_data
 from utils.logger import log_error
 from utils.intelligence import update_feature_weights
 from engine.ml_engine import ml_predictor
-import pandas as pd
+from engine.trading import check_and_execute_exits
+from engine.sentiment import sentiment_filter
+from collections import deque
+
+# Try to use orjson for faster JSON parsing (falls back to stdlib json)
+try:
+    import orjson
+    def _loads(data):
+        return orjson.loads(data)
+except ImportError:
+    _loads = json.loads
 
 class WebSocketManager:
     def __init__(self):
@@ -134,7 +144,7 @@ class WebSocketManager:
                             bot_state["ws_msg_count"] = self.msg_count
                             bot_state["ws_last_msg"] = self.last_msg_time
                             
-                            raw_data = json.loads(msg)
+                            raw_data = _loads(msg)
                             
                             if "stream" in raw_data:
                                 stream_name = raw_data["stream"]
@@ -156,8 +166,8 @@ class WebSocketManager:
                                         # Update active_positions cache on Fill/Partial
                                         if status in ["FILLED", "PARTIALLY_FILLED"]:
                                             # We trigger a background refresh to be 100% sure of the state
-                                            from engine.api import binance_request
                                             async def refresh_pos():
+                                                from engine.api import binance_request
                                                 res = await binance_request(client, 'GET', '/fapi/v2/positionRisk')
                                                 if res and res.status_code == 200:
                                                     bot_state["active_positions"] = [p for p in res.json() if float(p['positionAmt']) != 0]
@@ -182,8 +192,7 @@ class WebSocketManager:
                                             
                                             # Avoid double counting W/L for the same order
                                             if not hasattr(self, '_processed_orders'):
-                                                from collections import deque as _deque
-                                                self._processed_orders = _deque(maxlen=200)
+                                                self._processed_orders = deque(maxlen=200)
                                             if oid not in self._processed_orders:
                                                 rp = float(o.get("rp", 0))
                                                 # Skip if already counted by close_position_async
@@ -226,10 +235,8 @@ class WebSocketManager:
                                     market_data.prices[symbol] = price
                                     
                                     # FAST EXIT CHECK: If we have an active position, check exits immediately
-                                    active_symbols = [p['symbol'] for p in bot_state.get("active_positions", [])]
-                                    if symbol in active_symbols:
-                                        # Trigger fast exit check using current analysis context
-                                        from engine.trading import check_and_execute_exits
+                                    active_pos = bot_state.get("active_positions", [])
+                                    if active_pos and any(p['symbol'] == symbol for p in active_pos):
                                         all_valid = bot_state.get("last_scan_results", [])
                                         asyncio.create_task(check_and_execute_exits(client, symbol, price, all_valid))
                                 elif "@kline_" in stream_name:
@@ -268,12 +275,11 @@ class WebSocketManager:
                                         pass
                                 elif "forceOrder" in stream_name:
                                     try:
-                                        from engine.sentiment import sentiment_filter
                                         sentiment_filter.process_force_order(data)
                                     except Exception:
                                         pass
 
-                            if self.msg_count % 100 == 0:
+                            if self.msg_count % 500 == 0:
                                 bot_state["last_log"] = f"[bold green]WS Live: {self.msg_count} pkts | {len(self.active_streams)} streams[/]"
 
                         except (asyncio.TimeoutError, websockets.ConnectionClosed):

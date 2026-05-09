@@ -18,8 +18,13 @@ from engine.websocket import ws_manager
 from engine.trading import manage_active_positions, open_position_async
 from strategies.hybrid import get_btc_trend, analyze_hybrid_async
 from strategies.analyzer import MarketAnalyzer
+from engine.multi_exchange import bybit_feed, okx_feed
 
 ticker_cache = {} # {symbol: last_data}
+
+# Dashboard render cache - avoid recalculating static elements
+_vp_cache = {}  # {symbol: (last_ot, vp_result)}
+_last_layout_cache = {"ts": 0, "layout": None}
 
 def generate_sparkline(prices):
     if not prices or len(prices) < 2: return ""
@@ -81,11 +86,18 @@ async def generate_dashboard_async(client):
                 consensus = "◆" if (ml_prob > 0.7 or ml_prob < 0.3) else ("◇" if (ml_prob > 0.6 or ml_prob < 0.4) else " ")
                 ml_str = f"[{ml_col}]{ml_prob:.2f}{consensus}[/]"
                 
-                # POC Distance
+                # POC Distance (cached)
                 poc_dist_str = "[dim]-[/]"
                 sym_full = r['sym'] + "USDT"
                 if sym_full in market_data.klines and "15m" in market_data.klines[sym_full]:
-                    vp = MarketAnalyzer.get_volume_profile(market_data.klines[sym_full]["15m"])
+                    d15 = market_data.klines[sym_full]["15m"]
+                    vp_key = float(d15.iloc[-1]['ot']) if not d15.empty else 0
+                    cached_vp = _vp_cache.get(sym_full)
+                    if cached_vp and cached_vp[0] == vp_key:
+                        vp = cached_vp[1]
+                    else:
+                        vp = MarketAnalyzer.get_volume_profile(d15)
+                        _vp_cache[sym_full] = (vp_key, vp)
                     if vp:
                         curr_p = float(r['price'].replace(',', ''))
                         dist = (curr_p - vp['poc']) / vp['poc'] * 100
@@ -153,15 +165,17 @@ async def generate_dashboard_async(client):
                 # Volume Profile & VSA Insights
                 sym_full = best_pick['sym'] + "USDT"
                 if sym_full in market_data.klines and "15m" in market_data.klines[sym_full]:
-                    vp = MarketAnalyzer.get_volume_profile(market_data.klines[sym_full]["15m"])
+                    cached_vp = _vp_cache.get(sym_full)
+                    vp = cached_vp[1] if cached_vp else None
                     if vp:
                         curr_p = float(best_pick['price'].replace(',', ''))
                         if curr_p > vp['poc']: reasons.append("[bold green]ABOVE POC[/]")
                         else: reasons.append("[bold red]BELOW POC[/]")
                     
-                    vsa_sig = MarketAnalyzer.detect_vsa_signals(market_data.klines[sym_full]["1m"])
-                    if vsa_sig != 0:
-                        reasons.append(f"[bold yellow]VSA ({'BULL' if vsa_sig==1 else 'BEAR'})[/]")
+                    if "1m" in market_data.klines[sym_full]:
+                        vsa_sig = MarketAnalyzer.detect_vsa_signals(market_data.klines[sym_full]["1m"])
+                        if vsa_sig != 0:
+                            reasons.append(f"[bold yellow]VSA ({'BULL' if vsa_sig==1 else 'BEAR'})[/]")
 
                 reason_str = " + ".join(reasons) if reasons else "STRONG MOMENTUM"
                 regime_str = best_pick.get("regime", "SCANNING")
@@ -316,7 +330,6 @@ async def generate_dashboard_async(client):
         pnl_col = "bold bright_green" if display_pnl > 0 else ("bold bright_red" if display_pnl < 0 else "white")
 
         # Cross-exchange status
-        from engine.multi_exchange import bybit_feed, okx_feed
         xch_parts = []
         if bybit_feed.connected: xch_parts.append("[green]BY✓[/]")
         else: xch_parts.append("[red]BY✗[/]")

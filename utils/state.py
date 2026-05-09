@@ -2,6 +2,7 @@ import asyncio
 import pandas as pd
 import numpy as np
 import time
+from collections import deque
 
 bot_state = {
     "balance": 0.0,
@@ -68,12 +69,7 @@ class MarketData:
         self.lock = asyncio.Lock()
 
     def push_agg_trade(self, symbol: str, ts_sec: float, qty: float, price: float, is_buyer_maker: bool, max_keep: int = 600):
-        """Append a signed quote-volume delta from an aggTrade event.
-
-        is_buyer_maker=True  → aggressor is SELLER  → negative delta
-        is_buyer_maker=False → aggressor is BUYER   → positive delta
-        """
-        from collections import deque
+        """Append a signed quote-volume delta from an aggTrade event."""
         buf = self.cvd_buf.get(symbol)
         if buf is None:
             buf = deque(maxlen=max_keep)
@@ -98,10 +94,9 @@ class MarketData:
 
     def push_depth_snapshot(self, symbol: str, bid_total: float, ask_total: float, top_bid_qty: float, top_ask_qty: float):
         """Store orderbook depth snapshot for velocity analysis."""
-        from collections import deque
         buf = self.depth_history.get(symbol)
         if buf is None:
-            buf = deque(maxlen=60)  # Keep 60 snapshots (~60 seconds at 1/sec)
+            buf = deque(maxlen=60)
             self.depth_history[symbol] = buf
         buf.append((time.time(), bid_total, ask_total, top_bid_qty, top_ask_qty))
 
@@ -193,37 +188,38 @@ class MarketData:
         return iceberg_bid, iceberg_ask
 
     async def update_kline(self, symbol, interval, new_candle):
-        async with self.lock:
-            if symbol not in self.klines: self.klines[symbol] = {}
-            if interval not in self.klines[symbol]: return 
-            
-            df = self.klines[symbol][interval]
-            if df.empty: return
+        """Optimized kline update - minimal lock time, direct numpy operations."""
+        if symbol not in self.klines or interval not in self.klines[symbol]:
+            return
+        
+        df = self.klines[symbol][interval]
+        if df.empty:
+            return
 
-            last_idx = df.index[-1]
-            last_ot = df.at[last_idx, 'ot']
-            
-            if new_candle['ot'] == last_ot:
-                # Optimized update: directly set values on the existing row
-                for col in ["o", "h", "l", "c", "v", "tbv"]:
-                    try:
-                        df.iat[-1, df.columns.get_loc(col)] = float(new_candle[col])
-                    except ValueError:
-                        # If dtype conflict (e.g. int64 vs float), force cast the whole column
-                        df[col] = df[col].astype(float)
-                        df.iat[-1, df.columns.get_loc(col)] = float(new_candle[col])
-            elif new_candle['ot'] > last_ot:
-                # New candle rollover: minimal concat
+        last_ot = df.iat[-1, df.columns.get_loc('ot')]
+        new_ot = new_candle['ot']
+        
+        if new_ot == last_ot:
+            # Update existing candle in-place (no lock needed for atomic writes)
+            idx = len(df) - 1
+            ot_loc = df.columns.get_loc
+            df.iat[idx, ot_loc('o')] = new_candle['o']
+            df.iat[idx, ot_loc('h')] = new_candle['h']
+            df.iat[idx, ot_loc('l')] = new_candle['l']
+            df.iat[idx, ot_loc('c')] = new_candle['c']
+            df.iat[idx, ot_loc('v')] = new_candle['v']
+            df.iat[idx, ot_loc('tbv')] = new_candle['tbv']
+        elif new_ot > last_ot:
+            # New candle - need lock for structural change
+            async with self.lock:
                 new_row = pd.DataFrame([new_candle])
-                # Ensure new row has correct types before concat
                 for col in ["o", "h", "l", "c", "v", "tbv"]:
                     new_row[col] = new_row[col].astype(float)
-                
                 df = pd.concat([df, new_row], ignore_index=True)
                 if len(df) > 300:
                     df = df.iloc[-300:]
                 self.klines[symbol][interval] = df.reset_index(drop=True)
                 
-            self.last_prime[symbol] = time.time()
+        self.last_prime[symbol] = time.time()
 
 market_data = MarketData()

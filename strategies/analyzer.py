@@ -1,6 +1,149 @@
 import pandas as pd
 import numpy as np
 from functools import lru_cache
+import time
+from numba import njit, prange
+
+# Pre-computed indicator cache to avoid recalculating on every tick
+_indicator_cache = {}  # {(symbol, interval, last_ot): {indicators}}
+_CACHE_TTL = 2.0  # seconds
+
+
+def _cache_key(df, prefix=""):
+    """Generate cache key from dataframe's last open time."""
+    if df is None or df.empty:
+        return None
+    return (prefix, float(df.iloc[-1]['ot']), len(df))
+
+
+@njit(cache=True)
+def _ema_loop(arr, alpha):
+    """Numba-accelerated EMA computation."""
+    n = len(arr)
+    out = np.empty(n)
+    out[0] = arr[0]
+    for i in range(1, n):
+        out[i] = alpha * arr[i] + (1.0 - alpha) * out[i-1]
+    return out
+
+
+@njit(cache=True)
+def _rsi_loop(vals, length):
+    """Numba-accelerated RSI computation."""
+    n = len(vals)
+    rsi = np.empty(n)
+    alpha = 1.0 / length
+    avg_gain = 0.0
+    avg_loss = 0.0
+    
+    for i in range(n):
+        if i == 0:
+            delta = 0.0
+        else:
+            delta = vals[i] - vals[i-1]
+        gain = delta if delta > 0 else 0.0
+        loss = -delta if delta < 0 else 0.0
+        avg_gain = alpha * gain + (1.0 - alpha) * avg_gain
+        avg_loss = alpha * loss + (1.0 - alpha) * avg_loss
+        if avg_loss == 0:
+            rsi[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100.0 - (100.0 / (1.0 + rs))
+    return rsi
+
+
+@njit(cache=True)
+def _atr_loop(high, low, close, length):
+    """Numba-accelerated ATR computation."""
+    n = len(high)
+    tr = np.empty(n)
+    atr = np.empty(n)
+    alpha = 2.0 / (length + 1)
+    
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i-1])
+        lc = abs(low[i] - close[i-1])
+        tr[i] = max(hl, max(hc, lc))
+    
+    atr[0] = tr[0]
+    for i in range(1, n):
+        atr[i] = alpha * tr[i] + (1.0 - alpha) * atr[i-1]
+    return atr
+
+
+@njit(cache=True)
+def _adx_loop(high, low, close, length):
+    """Numba-accelerated ADX computation."""
+    n = len(high)
+    alpha = 2.0 / (length + 1)
+    
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
+    tr = np.zeros(n)
+    
+    tr[0] = high[0] - low[0]
+    for i in range(1, n):
+        up = high[i] - high[i-1]
+        down = low[i-1] - low[i]
+        if up > down and up > 0:
+            plus_dm[i] = up
+        if down > up and down > 0:
+            minus_dm[i] = down
+        hl = high[i] - low[i]
+        hc = abs(high[i] - close[i-1])
+        lc = abs(low[i] - close[i-1])
+        tr[i] = max(hl, max(hc, lc))
+    
+    # EMA smoothing
+    atr_s = np.empty(n)
+    pdi_s = np.empty(n)
+    mdi_s = np.empty(n)
+    atr_s[0] = tr[0]
+    pdi_s[0] = plus_dm[0]
+    mdi_s[0] = minus_dm[0]
+    for i in range(1, n):
+        atr_s[i] = alpha * tr[i] + (1.0 - alpha) * atr_s[i-1]
+        pdi_s[i] = alpha * plus_dm[i] + (1.0 - alpha) * pdi_s[i-1]
+        mdi_s[i] = alpha * minus_dm[i] + (1.0 - alpha) * mdi_s[i-1]
+    
+    dx = np.empty(n)
+    adx = np.empty(n)
+    for i in range(n):
+        pdi = 100.0 * pdi_s[i] / (atr_s[i] + 1e-8)
+        mdi = 100.0 * mdi_s[i] / (atr_s[i] + 1e-8)
+        dx[i] = abs(pdi - mdi) / (pdi + mdi + 1e-8) * 100.0
+    
+    adx[0] = dx[0]
+    for i in range(1, n):
+        adx[i] = alpha * dx[i] + (1.0 - alpha) * adx[i-1]
+    
+    return adx[-1]
+
+
+@njit(cache=True)
+def _hmm_forward(returns, trans, means, stds):
+    """Numba-accelerated HMM forward pass."""
+    n_states = 2
+    log_alpha = np.array([-0.5, -0.5])
+    
+    for r in returns:
+        log_emit = np.empty(n_states)
+        for s in range(n_states):
+            log_emit[s] = -0.5 * ((r - means[s]) / stds[s])**2 - np.log(stds[s])
+        
+        new_alpha = np.empty(n_states)
+        for j in range(n_states):
+            a = log_alpha[0] + np.log(trans[0, j])
+            b = log_alpha[1] + np.log(trans[1, j])
+            mx = max(a, b)
+            new_alpha[j] = log_emit[j] + mx + np.log(np.exp(a - mx) + np.exp(b - mx))
+        log_alpha = new_alpha
+    
+    return 0 if log_alpha[0] > log_alpha[1] else 1
+
 
 class MarketAnalyzer:
     # HMM parameters (pre-fitted on typical crypto regimes)
@@ -12,85 +155,52 @@ class MarketAnalyzer:
 
     @staticmethod
     def detect_hmm_regime(df, lookback=50):
-        """Hidden Markov Model regime detection using Viterbi-like forward pass.
-        
-        Returns: 'MEAN_REVERT' or 'MOMENTUM' based on most likely current state.
-        """
+        """Hidden Markov Model regime detection using numba-accelerated Viterbi."""
         if len(df) < lookback:
             return "UNKNOWN"
         try:
-            returns = df['c'].pct_change().tail(lookback).dropna().values
+            returns = df['c'].pct_change().tail(lookback).dropna().values.astype(np.float64)
             if len(returns) < 10:
                 return "UNKNOWN"
             
             trans = MarketAnalyzer._hmm_transition
             means = MarketAnalyzer._hmm_means
             stds = MarketAnalyzer._hmm_stds
-            n_states = 2
             
-            # Forward algorithm (log space for numerical stability)
-            log_alpha = np.zeros(n_states)
-            log_alpha[0] = -0.5  # Slight prior for low-vol state
-            log_alpha[1] = -0.5
-            
-            for r in returns:
-                # Emission probability (Gaussian)
-                log_emit = np.array([
-                    -0.5 * ((r - means[s]) / stds[s])**2 - np.log(stds[s])
-                    for s in range(n_states)
-                ])
-                # Transition + previous state
-                new_alpha = np.zeros(n_states)
-                for j in range(n_states):
-                    new_alpha[j] = log_emit[j] + np.logaddexp(
-                        log_alpha[0] + np.log(trans[0, j]),
-                        log_alpha[1] + np.log(trans[1, j])
-                    )
-                log_alpha = new_alpha
-            
-            # Most likely current state
-            current_state = np.argmax(log_alpha)
+            current_state = _hmm_forward(returns, trans, means, stds)
             return "MEAN_REVERT" if current_state == 0 else "MOMENTUM"
         except:
             return "UNKNOWN"
     @staticmethod
     def get_ema(series, length):
-        return series.ewm(span=length, adjust=False).mean()
+        vals = series.values if hasattr(series, 'values') else np.asarray(series, dtype=np.float64)
+        alpha = 2.0 / (length + 1)
+        result = _ema_loop(vals, alpha)
+        return pd.Series(result, index=series.index if hasattr(series, 'index') else None)
 
     @staticmethod
     def get_rsi(series, length=14):
-        delta = series.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=length).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=length).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        vals = series.values if hasattr(series, 'values') else np.asarray(series, dtype=np.float64)
+        rsi = _rsi_loop(vals, length)
+        return pd.Series(rsi, index=series.index if hasattr(series, 'index') else None)
 
     @staticmethod
     def get_atr(df, length=14):
-        high_low = df['h'] - df['l']
-        high_cp = (df['h'] - df['c'].shift(1)).abs()
-        low_cp = (df['l'] - df['c'].shift(1)).abs()
-        tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
-        return tr.rolling(window=length).mean()
+        h = df['h'].values.astype(np.float64)
+        l = df['l'].values.astype(np.float64)
+        c = df['c'].values.astype(np.float64)
+        atr = _atr_loop(h, l, c, length)
+        return pd.Series(atr, index=df.index)
 
     @staticmethod
     def get_adx(df, length=14):
-        """Calculate ADX (Average Directional Index). Returns scalar value."""
+        """Calculate ADX using numba JIT. Returns scalar value."""
         try:
-            if len(df) < length * 2: return 25  # Default neutral
-            high, low, close = df['h'], df['l'], df['c']
-            plus_dm = high.diff().clip(lower=0)
-            minus_dm = (-low.diff()).clip(lower=0)
-            # Zero out when other is larger
-            plus_dm[plus_dm < minus_dm] = 0
-            minus_dm[minus_dm < plus_dm] = 0
-            tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-            atr = tr.ewm(span=length, adjust=False).mean()
-            plus_di = 100 * (plus_dm.ewm(span=length, adjust=False).mean() / atr)
-            minus_di = 100 * (minus_dm.ewm(span=length, adjust=False).mean() / atr)
-            dx = (abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)) * 100
-            adx = dx.ewm(span=length, adjust=False).mean()
-            return float(adx.iloc[-1])
+            if len(df) < length * 2: return 25
+            h = df['h'].values.astype(np.float64)
+            l = df['l'].values.astype(np.float64)
+            c = df['c'].values.astype(np.float64)
+            return float(_adx_loop(h, l, c, length))
         except:
             return 25
 
@@ -98,25 +208,29 @@ class MarketAnalyzer:
     def get_volume_profile(df, bins=20):
         try:
             if len(df) < 30: return None
-            # Calculate price bins
-            price_min, price_max = df['l'].min(), df['h'].max()
+            c = df['c'].values
+            l_vals = df['l'].values
+            h_vals = df['h'].values
+            v = df['v'].values
+            
+            price_min, price_max = float(np.min(l_vals)), float(np.max(h_vals))
             if price_max == price_min: return None
             
             bin_size = (price_max - price_min) / bins
-            df['bin'] = ((df['c'] - price_min) / bin_size).astype(int).clip(0, bins-1)
+            bin_idx = np.clip(((c - price_min) / bin_size).astype(int), 0, bins-1)
             
-            # Aggregate volume by bin
-            profile = df.groupby('bin')['v'].sum()
-            poc_bin = profile.idxmax()
+            # Aggregate volume by bin using numpy bincount
+            profile = np.bincount(bin_idx, weights=v, minlength=bins)
+            poc_bin = int(np.argmax(profile))
             poc_price = price_min + (poc_bin * bin_size) + (bin_size / 2)
             
             # Value Area (70% of volume)
-            sorted_profile = profile.sort_values(ascending=False)
             total_vol = profile.sum()
+            sorted_bins = np.argsort(profile)[::-1]
             va_vol = 0
             va_bins = []
-            for b, v in sorted_profile.items():
-                va_vol += v
+            for b in sorted_bins:
+                va_vol += profile[b]
                 va_bins.append(b)
                 if va_vol >= total_vol * 0.7: break
             
@@ -128,47 +242,50 @@ class MarketAnalyzer:
 
     @staticmethod
     def detect_vsa_signals(df):
-        """Advanced VSA (Volume Spread Analysis) detection."""
+        """Advanced VSA (Volume Spread Analysis) detection - numpy optimized."""
         try:
             if len(df) < 5: return 0
-            curr = df.iloc[-1]
-            prev = df.iloc[-2]
-            vol_sma = df['v'].tail(20).mean()
+            v = df['v'].values
+            o = df['o'].values
+            h = df['h'].values
+            l = df['l'].values
+            c = df['c'].values
             
-            is_high_vol = curr['v'] > (vol_sma * 1.5)
-            is_low_vol = curr['v'] < (vol_sma * 0.7)
-            body = abs(curr['c'] - curr['o'])
-            range_ = curr['h'] - curr['l']
+            curr_v = v[-1]
+            curr_o, curr_h, curr_l, curr_c = o[-1], h[-1], l[-1], c[-1]
+            vol_sma = np.mean(v[-20:]) if len(v) >= 20 else np.mean(v)
+            
+            is_high_vol = curr_v > (vol_sma * 1.5)
+            is_low_vol = curr_v < (vol_sma * 0.7)
+            body = abs(curr_c - curr_o)
+            range_ = curr_h - curr_l
+            if range_ == 0: return 0
             
             # 1. Absorption
-            lower_wick = min(curr['o'], curr['c']) - curr['l']
+            lower_wick = min(curr_o, curr_c) - curr_l
             if is_high_vol and lower_wick > (range_ * 0.6) and body < (range_ * 0.3):
-                return 1 # Bullish Absorption
+                return 1
                 
-            upper_wick = curr['h'] - max(curr['o'], curr['c'])
+            upper_wick = curr_h - max(curr_o, curr_c)
             if is_high_vol and upper_wick > (range_ * 0.6) and body < (range_ * 0.3):
-                return -1 # Bearish Absorption
+                return -1
 
             # 2. No Demand / No Supply
-            # No Supply: Low volume, narrow range, down candle (Smart money not interested in selling)
-            if is_low_vol and range_ < (df['h'] - df['l']).tail(10).mean() * 0.8 and curr['c'] < curr['o']:
-                return 1 # Potential Bullish Reversal / Strength
-                
-            # No Demand: Low volume, narrow range, up candle (Smart money not interested in buying)
-            if is_low_vol and range_ < (df['h'] - df['l']).tail(10).mean() * 0.8 and curr['c'] > curr['o']:
-                return -1 # Potential Bearish Reversal / Weakness
+            avg_range = np.mean(h[-10:] - l[-10:])
+            if is_low_vol and range_ < (avg_range * 0.8) and curr_c < curr_o:
+                return 1
+            if is_low_vol and range_ < (avg_range * 0.8) and curr_c > curr_o:
+                return -1
 
             # 3. Stopping Volume
-            if is_high_vol and curr['c'] < prev['c'] and curr['c'] > curr['l'] + (range_ * 0.4):
-                return 1 # Stopping Volume (Bullish)
+            if is_high_vol and curr_c < c[-2] and curr_c > curr_l + (range_ * 0.4):
+                return 1
 
             # 4. Volume-Price Divergence
-            # Price making higher high but volume is lower (Weakness)
-            if curr['h'] > df['h'].iloc[-5:-1].max() and curr['v'] < df['v'].iloc[-5:-1].mean() * 0.8:
-                return -1 # Bearish Divergence (Exhaustion)
-            # Price making lower low but volume is lower (Weakness)
-            if curr['l'] < df['l'].iloc[-5:-1].min() and curr['v'] < df['v'].iloc[-5:-1].mean() * 0.8:
-                return 1 # Bullish Divergence (Exhaustion)
+            if curr_h > np.max(h[-5:-1]) and curr_v < np.mean(v[-5:-1]) * 0.8:
+                return -1
+            if curr_l < np.min(l[-5:-1]) and curr_v < np.mean(v[-5:-1]) * 0.8:
+                return 1
 
             return 0
         except: return 0
@@ -177,20 +294,28 @@ class MarketAnalyzer:
     def detect_regime(df):
         if len(df) < 30: return "RANGING"
         try:
-            close = df["c"]
-            ema20 = MarketAnalyzer.get_ema(close, 20)
-            atr = MarketAnalyzer.get_atr(df, 14)
-            atr_pct = (atr / close) * 100
+            c = df["c"].values.astype(np.float64)
+            n = len(c)
+            # Use numba EMA
+            ema20 = _ema_loop(c, 2.0 / 21)
             
-            curr_atr_p = atr_pct.iloc[-1]
-            atr_p75 = atr_pct.tail(100).quantile(0.75) if len(atr_pct) >= 100 else atr_pct.quantile(0.75)
+            # Fast ATR%
+            h = df['h'].values.astype(np.float64)
+            l = df['l'].values.astype(np.float64)
+            atr_vals = _atr_loop(h, l, c, 14)
+            atr_pct = (atr_vals / c) * 100
+            
+            # Rolling mean of last 14
+            curr_atr_p = np.mean(atr_pct[-14:])
+            lookback = min(100, n)
+            atr_p75 = np.percentile(atr_pct[-lookback:], 75)
             
             if curr_atr_p > atr_p75: return "VOLATILE"
             
-            # Z-score of price distance from EMA for trend detection
-            dist = ((close - ema20) / ema20 * 100).tail(30)
-            dist_std = dist.std()
-            curr_dist = dist.iloc[-1]
+            # Distance from EMA
+            dist = ((c[-30:] - ema20[-30:]) / ema20[-30:]) * 100
+            dist_std = np.std(dist)
+            curr_dist = dist[-1]
             if dist_std > 0 and abs(curr_dist) > dist_std * 1.2: return "TRENDING"
             return "RANGING"
         except: return "RANGING"
@@ -334,18 +459,16 @@ class MarketAnalyzer:
     def detect_structure(df):
         if len(df) < 15: return "CHOP", False, None, None
         try:
-            # Multi-candle structure detection (H10) using Rolling Max/Min (Fractals)
-            # Find the actual swing points in the recent window
-            recent_high = df['h'].tail(15).max()
-            recent_low = df['l'].tail(15).min()
-            
-            # Simple fractal detection (lookback 2, lookforward 2)
             highs = df['h'].values
             lows = df['l'].values
+            recent_high = float(np.max(highs[-15:]))
+            recent_low = float(np.min(lows[-15:]))
             
+            # Vectorized fractal detection (lookback 2, lookforward 2)
             pivot_highs = []
             pivot_lows = []
-            for i in range(2, len(df)-2):
+            n = len(highs)
+            for i in range(max(n-20, 2), n-2):
                 if highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i+1] and highs[i] > highs[i+2]:
                     pivot_highs.append(highs[i])
                 if lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i+1] and lows[i] < lows[i+2]:
@@ -357,12 +480,10 @@ class MarketAnalyzer:
                 if pivot_highs[-1] < pivot_highs[-2] and pivot_lows[-1] < pivot_lows[-2]:
                     return "BEARISH", False, recent_high, recent_low
                     
-            # Fallback to simple momentum if no clear pivots
-            h = df['h'].tail(5)
-            l = df['l'].tail(5)
-            if h.iloc[-1] > h.iloc[-2] and l.iloc[-1] > l.iloc[-2]: 
+            # Fallback to simple momentum
+            if highs[-1] > highs[-2] and lows[-1] > lows[-2]: 
                 return "BULLISH", False, recent_high, recent_low
-            if h.iloc[-1] < h.iloc[-2] and l.iloc[-1] < l.iloc[-2]: 
+            if highs[-1] < highs[-2] and lows[-1] < lows[-2]: 
                 return "BEARISH", False, recent_high, recent_low
                 
             return "CHOP", False, recent_high, recent_low

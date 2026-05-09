@@ -181,16 +181,10 @@ async def trading_loop(client):
             if loop_count % 20 == 0:
                 await get_market_depth_data(client, scan_targets)
             
-            # Concurrently analyze targeted symbols (batched to reduce CPU spike)
-            batch_size = 10
-            all_results = []
-            for batch_start in range(0, len(scan_targets), batch_size):
-                batch = scan_targets[batch_start:batch_start + batch_size]
-                tasks = [analyze_hybrid_async(client, s) for s in batch]
-                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                all_results.extend(zip(batch, batch_results))
-                if batch_start + batch_size < len(scan_targets):
-                    await asyncio.sleep(0.1)  # Brief pause between batches
+            # Concurrently analyze ALL targeted symbols in parallel (no batching delay)
+            tasks = [analyze_hybrid_async(client, s) for s in scan_targets]
+            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+            all_results = list(zip(scan_targets, batch_results))
             
             # Merge results into state
             current_results_map = {r["sym"]: r for r in bot_state.get("last_scan_results", []) if r.get("regime") != "SCANNING"}
@@ -309,7 +303,7 @@ async def trading_loop(client):
                 await asyncio.to_thread(save_state_to_db)
                 bot_state["last_db_save"] = now
 
-            await asyncio.sleep(max(0.5, min(2.0, 1.5 / max(bot_state.get("market_vol", 1.0), 0.5))))  # Adaptive: fast when volatile, slow when quiet
+            await asyncio.sleep(max(0.05, min(0.5, 0.3 / max(bot_state.get("market_vol", 1.0), 0.5))))  # Ultra-fast: 50ms-500ms adaptive
         except Exception as e:
             bot_state["last_log"] = f"[red]Loop Err: {str(e)[:40]}[/]"
             await asyncio.sleep(5)
@@ -335,7 +329,7 @@ async def main():
         
         ui_queue = asyncio.Queue()
 
-        with Live(None, refresh_per_second=2, screen=False) as live:
+        with Live(None, refresh_per_second=4, screen=False) as live:
             async def handle_keys():
                 def get_char():
                     if not os.isatty(sys.stdin.fileno()):
@@ -417,7 +411,7 @@ async def main():
 
                     dashboard = await generate_dashboard_async(client)
                     live.update(dashboard)
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.25)
                 except Exception as e:
                     bot_state["ui_active"] = False
                     try: live.start()

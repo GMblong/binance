@@ -283,17 +283,13 @@ async def partial_close_async(client, symbol, side, full_amt, pct, reason, pnl):
 
 async def check_and_execute_exits(client, symbol, current_price, all_signals=[]):
     """
-    ML-Adaptive Exit Engine with:
-    1. Structure-based trailing (not fixed %)
-    2. Partial TP at key levels
-    3. Time decay for stuck trades
-    4. Real-time ML re-evaluation
-    5. Momentum + VSA confluence exit
+    ML-Adaptive Exit Engine - optimized for sub-second response.
     """
     global last_exit_check
     now = time.time()
     
-    if now - last_exit_check.get(symbol, 0) < 1.0:
+    # Reduced throttle: 0.2s instead of 1.0s for faster exits
+    if now - last_exit_check.get(symbol, 0) < 0.2:
         return False
     last_exit_check[symbol] = now
     
@@ -468,6 +464,14 @@ async def manage_active_positions(client, all_signals):
             bot_state["logged_secure"] = []
             return []
         
+        # Batch fetch ALL open orders once (instead of per-symbol)
+        all_orders_res = await binance_request(client, 'GET', '/fapi/v1/openOrders')
+        all_open_orders = all_orders_res.json() if all_orders_res and all_orders_res.status_code == 200 else []
+        # Index by symbol for O(1) lookup
+        orders_by_symbol = {}
+        for o in all_open_orders:
+            orders_by_symbol.setdefault(o['symbol'], []).append(o)
+        
         for p in positions:
             symbol, amt = p['symbol'], float(p['positionAmt'])
             entry_price, mark_price = float(p['entryPrice']), float(p['markPrice'])
@@ -501,20 +505,16 @@ async def manage_active_positions(client, all_signals):
             ai = bot_state["trades"].get(symbol, {})
             if side == "LONG": ai["peak"] = max(ai.get("peak", mark_price), mark_price)
             else: ai["peak"] = min(ai.get("peak", mark_price), mark_price)
-            peak_pnl = abs((ai["peak"] - entry_price) / entry_price * 100)
 
-            # 2. ORDER PROTECTION (Symbol-specific check, Weight 1)
-            orders_res = await binance_request(client, 'GET', '/fapi/v1/openOrders', {"symbol": symbol})
-            symbol_orders = orders_res.json() if orders_res and orders_res.status_code == 200 else []
-            
+            # 2. ORDER PROTECTION - use pre-fetched orders (no extra API call)
+            symbol_orders = orders_by_symbol.get(symbol, [])
             has_sl = any(o['type'] in ['STOP_MARKET', 'STOP'] for o in symbol_orders)
             has_tp = any(o['type'] in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_orders)
 
             # --- STRUCTURAL SL PROTECTION ---
-            # Periodically check for new Order Blocks to move SL behind them
             k1m = market_data.klines.get(symbol, {}).get("1m")
             struct_sl = None
-            if k1m is not None:
+            if k1m is not None and len(k1m) >= 20:
                 if side == "LONG":
                     ob = MarketAnalyzer.find_nearest_order_block(k1m, mark_price, 1)
                     if ob and ob["bottom"] > entry_price:
@@ -528,14 +528,12 @@ async def manage_active_positions(client, all_signals):
                 prec = await get_symbol_precision(client, symbol)
                 if not has_sl or struct_sl:
                     if struct_sl:
-                        # Move SL to structure but keep it safe (buffer)
                         sl_price = round_step(struct_sl, prec["tick"])
                     else:
                         sl_mult = (1 - (ai.get("sl", 1.0)/100)) if side == "LONG" else (1 + (ai.get("sl", 1.0)/100))
                         sl_price = round_step(entry_price * sl_mult, prec["tick"])
                     
-                    # Update or Create SL
-                    if has_sl: # Cancel existing SL first if we are moving it
+                    if has_sl:
                         sl_order = next(o for o in symbol_orders if o['type'] in ['STOP_MARKET', 'STOP'])
                         await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": sl_order["orderId"]})
                     
@@ -545,12 +543,11 @@ async def manage_active_positions(client, all_signals):
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
 
-            # 3. EXIT LOGIC (Now handled by Fast Exit Engine)
-            all_valid = all_signals # Pass context
+            # 3. EXIT LOGIC (Fast Exit Engine)
+            all_valid = all_signals
             exit_triggered = await check_and_execute_exits(client, symbol, mark_price, all_valid)
             
             if not exit_triggered:
-                # Still check for BTC-DANGER which is a global factor
                 if bot_state["btc_state"] == "DANGER" and GLOBAL_BTC_EXIT:
                     await close_position_async(client, symbol, side, amt, "BTC-DANGER", pnl_pct)
 
