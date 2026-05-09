@@ -26,7 +26,10 @@ from strategies.hybrid import get_btc_trend, analyze_hybrid_async
 from utils.database import init_db, load_state_from_db, save_state_to_db
 from utils.intelligence import calculate_market_volatility, is_correlated_exposure
 from coin_screener import screen_coins
-from engine.multi_exchange import bybit_feed
+from engine.multi_exchange import bybit_feed, okx_feed, aggregate_flow
+from engine.auto_optimizer import auto_optimizer
+from engine.depth_predictor import depth_predictor
+from engine.sentiment import sentiment_filter
 from utils.logger import init_logger, log_error
 
 console = Console()
@@ -55,8 +58,8 @@ async def trading_loop(client):
         market_data.tickers = tkr
         for t in tkr: market_data.prices[t["s"]] = t["c"]
         last_ticker_refresh = time.time()
-        # Pre-train top 10 coins by volume
-        top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:10]
+        # Pre-train top 5 coins by volume
+        top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:5]
         pretrain_symbols = [t["s"] for t in top_by_vol]
         asyncio.create_task(ml_predictor.batch_pretrain(client, pretrain_symbols))
         bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(pretrain_symbols)} models...[/]"
@@ -147,6 +150,17 @@ async def trading_loop(client):
             net_bias = sum([1 if float(p['positionAmt']) > 0 else -1 for p in active_pos])
             bot_state["directional_bias"] = net_bias
 
+            # --- NEW: Auto-Optimizer, Sentiment, Depth Predictor, Clustering ---
+            if loop_count % 200 == 0:
+                await auto_optimizer.maybe_run(client)
+            if loop_count % 40 == 0:
+                from utils.intelligence import dynamic_clusterer
+                dynamic_clusterer.maybe_recluster()
+            # Sentiment check (background, non-blocking)
+            if sentiment_filter.should_pause():
+                bot_state["is_passive"] = True
+                bot_state["last_log"] = "[bold red]SENTIMENT PAUSE: High-impact event detected[/]"
+
             # Auto-reload DB weights periodically
             if loop_count % 100 == 0:
                 await asyncio.to_thread(load_state_from_db)
@@ -159,19 +173,29 @@ async def trading_loop(client):
                 
             market_data.current_scan_list = scan_targets
             
+            # Depth predictor observation (label walls for training)
+            for s in scan_targets[:10]:
+                depth_predictor.observe_and_label(s)
+            
             # Fetch institutional data (OI & Funding) periodically (Setiap ~30 detik untuk menghemat rate limit)
             if loop_count % 20 == 0:
                 await get_market_depth_data(client, scan_targets)
             
-            # Concurrently analyze targeted symbols
-            tasks = [analyze_hybrid_async(client, s) for s in scan_targets]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Concurrently analyze targeted symbols (batched to reduce CPU spike)
+            batch_size = 10
+            all_results = []
+            for batch_start in range(0, len(scan_targets), batch_size):
+                batch = scan_targets[batch_start:batch_start + batch_size]
+                tasks = [analyze_hybrid_async(client, s) for s in batch]
+                batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                all_results.extend(zip(batch, batch_results))
+                if batch_start + batch_size < len(scan_targets):
+                    await asyncio.sleep(0.1)  # Brief pause between batches
             
             # Merge results into state
             current_results_map = {r["sym"]: r for r in bot_state.get("last_scan_results", []) if r.get("regime") != "SCANNING"}
             
-            for i, res in enumerate(results):
-                sym = scan_targets[i]
+            for sym, res in all_results:
                 if isinstance(res, Exception):
                     log_error(f"Concurrent Analysis Error: {str(res)}")
                 elif res:
@@ -306,6 +330,8 @@ async def main():
         asyncio.create_task(ws_manager.start(client))
         asyncio.create_task(trading_loop(client))
         asyncio.create_task(bybit_feed.start())
+        asyncio.create_task(okx_feed.start())
+        asyncio.create_task(sentiment_filter.run_loop(client))
         
         ui_queue = asyncio.Queue()
 

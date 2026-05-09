@@ -36,14 +36,114 @@ def calculate_market_volatility():
         bot_state["market_vol"] = round(avg_vol / 1.0, 2) # Assuming 1.0% is baseline
     return bot_state["market_vol"]
 
-# Static mapping for demonstration (H7)
-SECTORS = {
+# Base sector mapping (fallback when clustering hasn't run yet)
+_BASE_SECTORS = {
     "BTCUSDT": "L1", "ETHUSDT": "L1", "SOLUSDT": "L1", "ADAUSDT": "L1",
     "DOGEUSDT": "MEME", "SHIBUSDT": "MEME", "PEPEUSDT": "MEME", "WIFUSDT": "MEME", "FLOKIUSDT": "MEME",
     "LINKUSDT": "L1", "AVAXUSDT": "L1", "DOTUSDT": "L1", "MATICUSDT": "L1", "SUIUSDT": "L2", "ARBUSDT": "L2",
     "UNIUSDT": "DEFI", "AAVEUSDT": "DEFI", "MKRUSDT": "DEFI",
     "FETUSDT": "AI", "AGIXUSDT": "AI", "OCEANUSDT": "AI", "WLDUSDT": "AI", "RENDERUSDT": "AI"
 }
+
+# Dynamic clusters (updated by DynamicClusterer)
+SECTORS = dict(_BASE_SECTORS)
+
+
+class DynamicClusterer:
+    """Auto-cluster coins by return correlation every 24h."""
+
+    def __init__(self):
+        self.last_run = 0
+        self.interval = 86400  # 24h
+
+    def maybe_recluster(self):
+        """Run clustering if enough time has passed."""
+        import time
+        now = time.time()
+        if now - self.last_run < self.interval:
+            return
+        self._run_clustering()
+        self.last_run = now
+
+    def _run_clustering(self):
+        """Cluster symbols based on 15m return correlation."""
+        global SECTORS
+        try:
+            # Collect returns from all symbols with 15m data
+            returns_dict = {}
+            for sym, klines in market_data.klines.items():
+                df = klines.get("15m")
+                if df is not None and len(df) >= 30:
+                    ret = df['c'].pct_change().tail(30).dropna().values
+                    if len(ret) >= 20:
+                        returns_dict[sym] = ret
+
+            if len(returns_dict) < 6:
+                return  # Not enough data
+
+            symbols = list(returns_dict.keys())
+            # Build correlation matrix
+            n = len(symbols)
+            min_len = min(len(v) for v in returns_dict.values())
+            matrix = np.array([returns_dict[s][-min_len:] for s in symbols])
+
+            # Correlation-based distance
+            corr = np.corrcoef(matrix)
+            corr = np.nan_to_num(corr, nan=0.0)
+            distance = 1 - corr
+
+            # Simple agglomerative clustering (no scipy needed)
+            n_clusters = min(6, n // 2)
+            labels = self._simple_cluster(distance, n_clusters)
+
+            # Assign cluster labels
+            cluster_names = ["C0", "C1", "C2", "C3", "C4", "C5"]
+            new_sectors = dict(_BASE_SECTORS)  # Start with base
+            for i, sym in enumerate(symbols):
+                cluster_id = labels[i]
+                new_sectors[sym] = cluster_names[cluster_id % len(cluster_names)]
+
+            SECTORS.update(new_sectors)
+            bot_state["last_log"] = f"[cyan]CLUSTER: Regrouped {len(symbols)} coins into {n_clusters} clusters[/]"
+
+        except Exception:
+            pass  # Silently fail, keep old sectors
+
+    def _simple_cluster(self, distance_matrix, n_clusters):
+        """Simple greedy clustering without scipy."""
+        n = len(distance_matrix)
+        labels = list(range(n))  # Each point starts as its own cluster
+
+        # Merge closest pairs until we have n_clusters
+        while len(set(labels)) > n_clusters:
+            min_dist = float('inf')
+            merge_i, merge_j = 0, 1
+            unique_labels = list(set(labels))
+
+            for idx_a in range(len(unique_labels)):
+                for idx_b in range(idx_a + 1, len(unique_labels)):
+                    la, lb = unique_labels[idx_a], unique_labels[idx_b]
+                    # Average linkage
+                    points_a = [i for i, l in enumerate(labels) if l == la]
+                    points_b = [i for i, l in enumerate(labels) if l == lb]
+                    avg_dist = np.mean([distance_matrix[i][j] for i in points_a for j in points_b])
+                    if avg_dist < min_dist:
+                        min_dist = avg_dist
+                        merge_i, merge_j = la, lb
+
+            # Merge cluster merge_j into merge_i
+            for i in range(n):
+                if labels[i] == merge_j:
+                    labels[i] = merge_i
+
+        # Renumber labels to 0..n_clusters-1
+        unique = list(set(labels))
+        remap = {old: new for new, old in enumerate(unique)}
+        return [remap[l] for l in labels]
+
+
+dynamic_clusterer = DynamicClusterer()
+
 
 def get_sector(symbol):
     return SECTORS.get(symbol, "UNKNOWN")

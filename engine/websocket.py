@@ -39,6 +39,7 @@ class WebSocketManager:
         agg_symbols = set(symbols[:AGG_TOP_N])
         depth_symbols = set(symbols[:DEPTH_TOP_N])
         desired = set()
+        desired.add("!forceOrder@arr")  # Global liquidation stream
         for s in symbols:
             s_low = s.lower()
             desired.add(f"{s_low}@ticker")
@@ -263,6 +264,12 @@ class WebSocketManager:
                                         if ask_total > 0:
                                             market_data.imbalance[sym_d] = bid_total / ask_total
                                         market_data.push_depth_snapshot(sym_d, bid_total, ask_total, top_bid_qty, top_ask_qty)
+                                    except Exception:
+                                        pass
+                                elif "forceOrder" in stream_name:
+                                    try:
+                                        from engine.sentiment import sentiment_filter
+                                        sentiment_filter.process_force_order(data)
                                     except Exception:
                                         pass
 

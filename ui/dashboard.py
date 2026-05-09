@@ -58,7 +58,7 @@ async def generate_dashboard_async(client):
             table.add_column("ML PROB", justify="center")
             table.add_column("POC DIST", justify="center")
             table.add_column("SCORE", justify="center")
-            table.add_column("SMC STRUCT", justify="center")
+            table.add_column("REGIME", justify="center")
             table.add_column("SIGNAL", justify="right")
             
             if not data:
@@ -71,13 +71,15 @@ async def generate_dashboard_async(client):
                 
                 # Trend Direction Indicator
                 is_bull = r.get("dir", 0) == 1
-                trend_icon = "🔼" if is_bull else ("🔽" if r.get("dir", 0) == -1 else "➖")
+                trend_icon = "▲" if is_bull else ("▼" if r.get("dir", 0) == -1 else "—")
                 trend_col = "bold green" if is_bull else ("bold red" if r.get("dir", 0) == -1 else "dim white")
                 
-                # ML Probability
+                # ML Probability with consensus indicator
                 ml_prob = r.get("ai", {}).get("ml_prob", 0.5)
-                ml_col = "green" if ml_prob > 0.65 else ("red" if ml_prob < 0.35 else "white")
-                ml_str = f"[{ml_col}]{ml_prob:.2f}[/]"
+                ml_col = "bold green" if ml_prob > 0.65 else ("bold red" if ml_prob < 0.35 else "white")
+                # Consensus: if prob is far from 0.5, models likely agree
+                consensus = "◆" if (ml_prob > 0.7 or ml_prob < 0.3) else ("◇" if (ml_prob > 0.6 or ml_prob < 0.4) else " ")
+                ml_str = f"[{ml_col}]{ml_prob:.2f}{consensus}[/]"
                 
                 # POC Distance
                 poc_dist_str = "[dim]-[/]"
@@ -121,7 +123,7 @@ async def generate_dashboard_async(client):
                     ml_str,
                     poc_dist_str,
                     f"{score_bar} [bold]{score_val}%[/]", 
-                    f"[cyan]{r.get('struct', 'CHOP')}[/]", 
+                    f"[{'cyan' if r.get('regime','')=='TRENDING' else ('yellow' if r.get('regime','')=='RANGING' else ('red' if r.get('regime','')=='VOLATILE' else 'dim'))}]{r.get('regime', '...')[:5]}[/]", 
                     f"[{sig_style}]{sig}[/]\n[dim]{curr_price_live}[/]"
                 )
             return table
@@ -302,7 +304,7 @@ async def generate_dashboard_async(client):
 
         # --- UI COMPONENTS ---
         session = get_current_session()
-        sess_col = "cyan" if session == "LONDON" else ("green" if session == "NEW_YORK" else "yellow")
+        sess_col = "cyan" if session == "LONDON" else ("green" if session == "NEW_YORK" else ("magenta" if session == "ASIA" else "yellow"))
         
         mv = bot_state.get("market_vol", 1.0)
         mv_col = "green" if mv < 1.0 else ("red" if mv > 1.5 else "yellow")
@@ -313,24 +315,34 @@ async def generate_dashboard_async(client):
         
         pnl_col = "bold bright_green" if display_pnl > 0 else ("bold bright_red" if display_pnl < 0 else "white")
 
+        # Cross-exchange status
+        from engine.multi_exchange import bybit_feed, okx_feed
+        xch_parts = []
+        if bybit_feed.connected: xch_parts.append("[green]BY✓[/]")
+        else: xch_parts.append("[red]BY✗[/]")
+        if okx_feed.connected: xch_parts.append("[green]OKX✓[/]")
+        else: xch_parts.append("[red]OKX✗[/]")
+        xch_str = "|".join(xch_parts)
+
         # Card 1: Main Status
         opt_status = "[bold green]ONLINE[/]" if (time.time() % 60 < 5) else "[dim green]STANDBY[/]"
+        n_models = len(ml_predictor.models)
         status_card = Panel(
             Align.center(Text.from_markup(
-                f"[{hb_style}] {hb_char} [/][bold white on bright_magenta] SUPREME v9 [/]\n"
-                f"[dim white]SES: [/][{sess_col}]{session}[/] [dim]|[/] [dim white]OPT: [/]{opt_status}"
+                f"[{hb_style}] {hb_char} [/][bold white on bright_magenta] SUPREME v10 [/]\n"
+                f"[dim]SES:[/][{sess_col}]{session}[/] [dim]|[/] [dim]ML:[/][cyan]{n_models}[/] [dim]|[/] {xch_str}"
             )), border_style="bright_magenta", box=box.ROUNDED
         )
         
         # Card 2: Market Context
         market_card = Panel(
             Align.center(Text.from_markup(
-                f"[dim white]VOL: [/][{mv_col}]{mv:.1f}[/] [dim]|[/] [dim white]BIAS: [/][{bias_col}]{bias_str}[/]\n"
-                f"[dim white]BTC: [/][{btc_style}]{btc_status}[/]"
+                f"[dim]VOL:[/][{mv_col}]{mv:.1f}[/] [dim]|[/] [dim]BIAS:[/][{bias_col}]{bias_str}[/]\n"
+                f"[dim]BTC:[/][{btc_style}]{btc_status}[/]"
             )), title="[dim]MARKET[/]", border_style="cyan", box=box.ROUNDED
         )
         
-        # Card 3: Balance (DEDICATED)
+        # Card 3: Balance
         bal_card = Panel(
             Align.center(Text.from_markup(
                 f"[bold green]${bal_display}[/]\n"
@@ -338,11 +350,14 @@ async def generate_dashboard_async(client):
             )), title="[dim]BALANCE[/]", border_style="green", box=box.ROUNDED
         )
         
-        # Card 4: Performance (DEDICATED)
+        # Card 4: Performance
+        total_trades = bot_state['wins'] + bot_state['losses']
+        wr_val = (bot_state['wins'] / total_trades * 100) if total_trades > 0 else 0
+        wr_col = "green" if wr_val >= 55 else ("yellow" if wr_val >= 45 else "red")
         perf_card = Panel(
             Align.center(Text.from_markup(
-                f"[bold yellow]{bot_state['wins']}W - {bot_state['losses']}L[/]\n"
-                f"[dim white]WinRate: [/][bold]{(bot_state['wins']/(bot_state['wins']+bot_state['losses'])*100) if (bot_state['wins']+bot_state['losses'])>0 else 0:.1f}%[/]"
+                f"[bold green]{bot_state['wins']}W[/] [dim]-[/] [bold red]{bot_state['losses']}L[/]\n"
+                f"[dim]WR:[/][{wr_col}]{wr_val:.0f}%[/] [dim]|[/] [dim]PF:[/][bold]{(bot_state['wins']/max(bot_state['losses'],1)):.1f}[/]"
             )), title="[dim]PERFORMANCE[/]", border_style="yellow", box=box.ROUNDED
         )
 
@@ -355,9 +370,9 @@ async def generate_dashboard_async(client):
             Layout(Panel(
                 Text.from_markup(
                     f"{bot_state['last_log']}\n"
-                    f"[dim white] [P] Passive | [C] Close All | [TAB] Select | [K] Cancel Limit | [X] Exit | Ref: {datetime.now().strftime('%H:%M:%S')}[/]"
+                    f"[dim] [P] Passive | [C] Close All | [M] Menu | [K] Cancel Limit | [X] Exit | ⚡{ws_pkts} | {datetime.now().strftime('%H:%M:%S')}[/]"
                 ), 
-                title=" SYSTEM LOGS & CONTROLS ", 
+                title=" SYSTEM ", 
                 border_style="dim", box=box.ROUNDED
             ), size=4)
         )
@@ -370,8 +385,8 @@ async def generate_dashboard_async(client):
         )
         
         # Consolidate and sort movers by score (top 15)
-        combined_list = sorted(all_valid, key=lambda x: x.get('score', 0), reverse=True)[:15]
-        layout["main"].update(create_combined_table("🔥 MARKET RADAR (TOP MOVERS)", combined_list))
+        combined_list = sorted(all_valid, key=lambda x: x.get('score', 0), reverse=True)[:12]
+        layout["main"].update(create_combined_table("🔥 MARKET RADAR", combined_list))
         
         return layout
     except Exception as e: return Panel(f"Error: {str(e)}")

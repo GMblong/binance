@@ -281,15 +281,48 @@ async def analyze_hybrid_async(client, symbol):
         elif direction == -1 and iceberg_bid:
             score = max(score - 10, 0)  # Hidden buyer blocks our short
         
-        # --- MULTI-EXCHANGE DIVERGENCE ---
-        from engine.multi_exchange import bybit_feed
-        divergence = bybit_feed.get_divergence(symbol)
-        if direction == 1 and divergence > 0.03:
-            score = min(score + 8, 100)  # Bybit higher = Binance will follow up
+        # --- MULTI-EXCHANGE DIVERGENCE (Aggregate: Binance + Bybit + OKX) ---
+        from engine.multi_exchange import aggregate_flow
+        avg_div, cvd_bias = aggregate_flow.get_cross_exchange_signal(symbol)
+        if direction == 1 and avg_div > 0.03:
+            score = min(score + 8, 100)
             active_features.append(f"{regime}:xchange")
-        elif direction == -1 and divergence < -0.03:
-            score = min(score + 8, 100)  # Bybit lower = Binance will follow down
+        elif direction == -1 and avg_div < -0.03:
+            score = min(score + 8, 100)
             active_features.append(f"{regime}:xchange")
+        # Cross-exchange CVD alignment
+        if direction == 1 and cvd_bias > 0.3:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:xcvd")
+        elif direction == -1 and cvd_bias < -0.3:
+            score = min(score + 5, 100)
+            active_features.append(f"{regime}:xcvd")
+        
+        # --- PREDICTIVE DEPTH (Real vs Fake Wall) ---
+        from engine.depth_predictor import depth_predictor
+        bid_real, ask_real = depth_predictor.predict(symbol)
+        if direction == 1 and bid_real > 0.7:
+            score = min(score + 5, 100)  # Real bid wall = support confirmed
+            active_features.append(f"{regime}:depth_pred")
+        elif direction == -1 and ask_real > 0.7:
+            score = min(score + 5, 100)  # Real ask wall = resistance confirmed
+            active_features.append(f"{regime}:depth_pred")
+        elif direction == 1 and ask_real > 0.8:
+            score = max(score - 8, 0)  # Real ask wall blocks our long
+        elif direction == -1 and bid_real > 0.8:
+            score = max(score - 8, 0)  # Real bid wall blocks our short
+        
+        # --- SENTIMENT FILTER ---
+        from engine.sentiment import sentiment_filter
+        sentiment = sentiment_filter.get_sentiment(symbol)
+        if sentiment < -0.5 and direction == 1:
+            score = max(score - 20, 0)  # Bearish event, don't go long
+        elif sentiment > 0.5 and direction == -1:
+            score = max(score - 20, 0)  # Bullish event, don't go short
+        liq_bias = sentiment_filter.get_liq_bias(symbol)
+        if liq_bias == direction:
+            score = min(score + 5, 100)  # Liquidation cascade in our direction
+            active_features.append(f"{regime}:liq_cascade")
         
         # 2. Smart limit price placement
         # Priority: Order Block > FVG > VWAP-area > EMA21 pullback
@@ -403,19 +436,19 @@ async def analyze_hybrid_async(client, symbol):
         is_breakout = raw_breakout and vol_confirmed and body_ratio > 0.5
         
         # Logika Baru: Adaptive Threshold berdasarkan Regime & Breakout
-        threshold = 80
+        threshold = 75
         if regime == "VOLATILE":
-            threshold = 75 if is_breakout else 90  # Very strict in volatile without breakout
+            threshold = 70 if is_breakout else 85
         elif regime == "RANGING":
-            threshold = 88  # Strict in ranging (most fakeouts happen here)
+            threshold = 82
         elif regime == "TRENDING":
-            threshold = 75 if is_breakout else 82
+            threshold = 68 if is_breakout else 75
             
         # --- ADAPTIVE EXECUTION ENGINE ---
         is_market_order = False
         
         # Market orders ONLY for confirmed breakouts with extreme conviction
-        if regime == "TRENDING" and is_breakout and score >= 90 and not is_fake_move:
+        if regime == "TRENDING" and is_breakout and score >= 85 and not is_fake_move:
             is_market_order = True
             limit_p = price
         # Everything else = limit order (sniper mode)
@@ -430,7 +463,7 @@ async def analyze_hybrid_async(client, symbol):
             # Limit order must be at a meaningful distance (not just chasing)
             if is_market_order:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-            elif dist >= 0.3 and dist <= 1.5:
+            elif dist >= 0.15 and dist <= 2.5:
                 # Good sniper distance: not too close (chasing), not too far (won't fill)
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
             elif dist < 0.3:
