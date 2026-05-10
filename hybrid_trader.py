@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.align import Align
 
-from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT
+from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_VOLUME_FILTER, CONSEC_LOSS_COOLDOWN_SEC, MAX_CONSEC_LOSSES, DB_SAVE_INTERVAL_SEC
 from utils.state import bot_state, market_data
 from engine.websocket import ws_manager
 from engine.api import binance_request, get_balance_async, get_market_depth_data
@@ -31,6 +31,7 @@ from engine.auto_optimizer import auto_optimizer
 from engine.depth_predictor import depth_predictor
 from engine.sentiment import sentiment_filter
 from utils.logger import init_logger, log_error
+from utils.telegram import send_telegram, alert_kill_switch, alert_circuit_breaker, alert_sentiment_pause, alert_startup, alert_shutdown, alert_error, alert_daily_summary, alert_cooldown, command_loop
 
 console = Console()
 init_db()
@@ -40,10 +41,13 @@ if not API_KEY or not API_SECRET or API_KEY == "YOUR_API_KEY":
     console.print("[bold red]ERROR: API_KEY or API_SECRET missing in .env file![/]")
     exit(1)
 
+shutdown_event = asyncio.Event()
+
 async def trading_loop(client):
     """Deeply optimized loop to prevent Rate Limits."""
     # Initial setup
     await get_balance_async(client)
+    asyncio.create_task(alert_startup(bot_state.get("balance", 0), len(bot_state.get("active_positions", []))))
     last_ticker_refresh = 0
     loop_count = 0
     
@@ -64,10 +68,25 @@ async def trading_loop(client):
         asyncio.create_task(ml_predictor.batch_pretrain(client, pretrain_symbols))
         bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(pretrain_symbols)} models...[/]"
     
-    while True:
+    while not shutdown_event.is_set():
         try:
             now = time.time()
             loop_count += 1
+            
+            # --- DAILY RESET (00:00 UTC) ---
+            from datetime import datetime, timezone
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            if bot_state.get("_last_day") != today_str:
+                # New day: reset start_balance, wins/losses, and re-enable trading
+                current_bal = bot_state.get("balance", 0)
+                if current_bal > 0:
+                    bot_state["start_balance"] = current_bal
+                bot_state["wins"] = 0
+                bot_state["losses"] = 0
+                bot_state["_last_day"] = today_str
+                if bot_state.get("is_passive") and not bot_state.get("_manual_passive"):
+                    bot_state["is_passive"] = False  # Re-enable if kill-switch paused yesterday
+                bot_state["last_log"] = f"[bold cyan]NEW DAY: Start balance reset to ${current_bal:.2f}[/]"
             
             # --- KILL-SWITCH HARIAN (C1) ---
             if bot_state.get("start_balance", 0) > 0:
@@ -76,6 +95,7 @@ async def trading_loop(client):
                     if not bot_state.get("is_passive", False):
                         bot_state["is_passive"] = True
                         bot_state["last_log"] = f"[bold red]KILL-SWITCH ACTIVATED (PnL: {daily_pnl_pct:.2f}%)![/]"
+                        asyncio.create_task(alert_kill_switch(daily_pnl_pct, bot_state.get('balance', 0)))
                         # Clean up positions and orders
                         active_pos = bot_state.get("active_positions", [])
                         for p in active_pos:
@@ -120,7 +140,7 @@ async def trading_loop(client):
                 else: t["cp"] = 0
 
             # 3. Smart Coin Selection (Multi-Factor Screener)
-            filtered = [t for t in market_data.tickers if t["q"] > 5_000_000]
+            filtered = [t for t in market_data.tickers if t["q"] > MIN_VOLUME_FILTER]
             top_symbols = screen_coins(filtered, top_n=30)
             
             # TURBO UI Placeholder
@@ -158,6 +178,8 @@ async def trading_loop(client):
                 dynamic_clusterer.maybe_recluster()
             # Sentiment check (background, non-blocking)
             if sentiment_filter.should_pause():
+                if not bot_state.get("is_passive", False):
+                    asyncio.create_task(alert_sentiment_pause())
                 bot_state["is_passive"] = True
                 bot_state["last_log"] = "[bold red]SENTIMENT PAUSE: High-impact event detected[/]"
 
@@ -239,11 +261,12 @@ async def trading_loop(client):
                     if bot_state.get("blacklist", {}).get(sym_full, 0) > time.time(): continue
                     
                     sym_perf = bot_state.get("sym_perf", {}).get(sym_full, {})
-                    if sym_perf.get("c", 0) >= 3:
+                    if sym_perf.get("c", 0) >= MAX_CONSEC_LOSSES:
                         last_loss = sym_perf.get("last_loss_time", 0)
-                        if time.time() - last_loss < 3600: # 60 menit cooldown pasca 3 beruntun loss
-                            bot_state.setdefault("blacklist", {})[sym_full] = time.time() + 3600
+                        if time.time() - last_loss < CONSEC_LOSS_COOLDOWN_SEC:
+                            bot_state.setdefault("blacklist", {})[sym_full] = time.time() + CONSEC_LOSS_COOLDOWN_SEC
                             bot_state["sym_perf"][sym_full]["c"] = 0 # Reset biar tidak infinite loop
+                            asyncio.create_task(alert_cooldown(sym_full, MAX_CONSEC_LOSSES))
                             continue
                             
                     is_replacement = sym_full in bot_state.get("limit_orders", {})
@@ -277,14 +300,15 @@ async def trading_loop(client):
                                     # Also delete associated SL/TP algo orders
                                     await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym_full})
                                     del bot_state["limit_orders"][sym_full]
-                                except: pass
+                                except Exception as e:
+                                    log_error(f"Order replacement cancel failed for {sym_full}: {e}", include_traceback=False)
                             
                             await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
 
             bot_state["heartbeat"] += 1
             
             # --- API CIRCUIT BREAKER (M5) & BATCHED DB WRITES (M3) ---
-            if now - bot_state.get("last_db_save", 0) > 30:
+            if now - bot_state.get("last_db_save", 0) > DB_SAVE_INTERVAL_SEC:
                 # 1. API Circuit Breaker Eval
                 reqs = bot_state.get("api_req_count", 0)
                 errs = bot_state.get("api_err_count", 0)
@@ -293,6 +317,7 @@ async def trading_loop(client):
                     if err_rate > 0.3: # >30% error rate
                         bot_state["api_health_status"] = "BLOCKED"
                         bot_state["last_log"] = f"[bold white on red]API CIRCUIT BREAKER! Rate: {err_rate*100:.1f}%[/]"
+                        asyncio.create_task(alert_circuit_breaker(err_rate))
                     elif err_rate > 0.1:
                         bot_state["api_health_status"] = "DEGRADED"
                     else:
@@ -309,19 +334,32 @@ async def trading_loop(client):
                 await asyncio.to_thread(save_state_to_db)
                 bot_state["last_db_save"] = now
 
+            # 3. Hourly Summary to Telegram
+            if loop_count % 2400 == 0:  # ~every hour (2400 loops * ~1.5s avg)
+                balance = bot_state.get("balance", 0)
+                start = bot_state.get("start_balance", 0)
+                pnl = balance - start if start > 0 else 0
+                asyncio.create_task(alert_daily_summary(balance, pnl, bot_state.get("wins", 0), bot_state.get("losses", 0)))
+
             await asyncio.sleep(max(0.05, min(0.5, 0.3 / max(bot_state.get("market_vol", 1.0), 0.5))))  # Ultra-fast: 50ms-500ms adaptive
         except Exception as e:
             bot_state["last_log"] = f"[red]Loop Err: {str(e)[:40]}[/]"
+            asyncio.create_task(alert_error(str(e)))
             await asyncio.sleep(5)
 
+
 async def cleanup_and_exit(client):
-    """Clean up all pending orders before exiting."""
+    """Clean up all pending orders and signal shutdown."""
     bot_state["last_log"] = "[bold red]EXITING: Cleaning up...[/]"
     limit_orders = list(bot_state.get("limit_orders", {}).keys())
     for sym in limit_orders:
         try: await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
-        except: pass
-    os._exit(0)
+        except Exception:
+            pass
+    ws_manager.running = False
+    save_state_to_db()
+    await alert_shutdown()
+    shutdown_event.set()
 
 async def main():
     init_logger()
@@ -332,6 +370,39 @@ async def main():
         asyncio.create_task(bybit_feed.start())
         asyncio.create_task(okx_feed.start())
         asyncio.create_task(sentiment_filter.run_loop(client))
+        
+        # Telegram command handler
+        tg_action_queue = asyncio.Queue()
+        asyncio.create_task(command_loop(bot_state, market_data, tg_action_queue))
+
+        async def process_tg_actions():
+            while not shutdown_event.is_set():
+                try:
+                    action = await asyncio.wait_for(tg_action_queue.get(), timeout=1)
+                    if action == "CLOSE_ALL":
+                        res = await binance_request(client, 'GET', '/fapi/v2/positionRisk')
+                        if res and res.status_code == 200:
+                            for p in [x for x in res.json() if float(x['positionAmt']) != 0]:
+                                await close_position_async(client, p['symbol'], "LONG" if float(p['positionAmt'])>0 else "SHORT", float(p['positionAmt']), "TELEGRAM")
+                    elif action == "CANCEL_ORDERS":
+                        for sym in list(bot_state.get("limit_orders", {}).keys()):
+                            await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym})
+                        bot_state["limit_orders"] = {}
+                    elif action == "SHUTDOWN":
+                        await cleanup_and_exit(client)
+                    elif action.startswith("CLOSE:"):
+                        symbol = action.split(":", 1)[1]
+                        pos = next((p for p in bot_state.get("active_positions", []) if p['symbol'] == symbol), None)
+                        if pos:
+                            await close_position_async(client, pos['symbol'], "LONG" if float(pos['positionAmt'])>0 else "SHORT", float(pos['positionAmt']), "TELEGRAM")
+                        else:
+                            await send_telegram(f"❌ No position found for {symbol}")
+                except asyncio.TimeoutError:
+                    continue
+                except Exception:
+                    await asyncio.sleep(1)
+
+        asyncio.create_task(process_tg_actions())
         
         ui_queue = asyncio.Queue()
 
@@ -345,13 +416,13 @@ async def main():
                         tty.setcbreak(sys.stdin.fileno())
                         if select.select([sys.stdin], [], [], 0.1)[0]:
                             return sys.stdin.read(1)
-                    except:
+                    except (OSError, termios.error):
                         return None
                     finally:
                         termios.tcsetattr(sys.stdin, termios.TCSANOW, old_settings)
                     return None
 
-                while True:
+                while not shutdown_event.is_set():
                     try:
                         if bot_state.get("ui_active", False):
                             await asyncio.sleep(0.2)
@@ -388,7 +459,7 @@ async def main():
                         await asyncio.sleep(1)
             
             asyncio.create_task(handle_keys())
-            while True:
+            while not shutdown_event.is_set():
                 try:
                     if not ui_queue.empty():
                         action = await ui_queue.get()
@@ -421,9 +492,14 @@ async def main():
                 except Exception as e:
                     bot_state["ui_active"] = False
                     try: live.start()
-                    except: pass
+                    except Exception: pass
                     await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except KeyboardInterrupt: os._exit(0)
+    except (KeyboardInterrupt, SystemExit, RuntimeError):
+        pass
+    finally:
+        from utils.database import save_state_to_db
+        save_state_to_db()
+        sys.exit(0)

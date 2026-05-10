@@ -1,15 +1,19 @@
 import time
 import math
-from utils.config import ACCOUNT_RISK_PERCENT, MAX_LEVERAGE, EXIT_ON_REVERSAL, GLOBAL_BTC_EXIT, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT
+import asyncio
+import httpx
+from typing import Optional
+from utils.config import ACCOUNT_RISK_PERCENT, MAX_LEVERAGE, EXIT_ON_REVERSAL, GLOBAL_BTC_EXIT, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_NOTIONAL_USD
 from utils.state import bot_state, market_data
 from utils.helpers import round_step
 from engine.api import binance_request, get_symbol_precision
 from utils.logger import log_error
+from utils.telegram import alert_open_position, alert_close_position, alert_partial_close, alert_limit_filled
 from utils.intelligence import calculate_kelly_risk, update_feature_weights
 from engine.ml_engine import ml_predictor
 from strategies.analyzer import MarketAnalyzer
 
-async def open_position_async(client, symbol, side, signal_type, ai_brain):
+async def open_position_async(client: httpx.AsyncClient, symbol: str, side: str, signal_type: str, ai_brain: dict) -> bool:
     try:
         prec = await get_symbol_precision(client, symbol)
         
@@ -38,6 +42,15 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         else:
             risk_amt = base_risk * 0.5 * kelly_mult
 
+        # --- CONFIDENCE DECAY: reduce size on recent losing streak ---
+        recent = perf[-5:] if len(perf) >= 3 else []
+        if recent:
+            recent_wr = sum(recent) / len(recent)
+            if recent_wr <= 0.2:
+                risk_amt *= 0.3
+            elif recent_wr <= 0.4:
+                risk_amt *= 0.6
+
         sl_pct = max(0.1, ai_brain.get("sl", 1.0)) # Safety: Min 0.1% SL
         
         # Prevent division by zero if limit_price is too small and rounded to 0
@@ -60,7 +73,7 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         if quantity <= 0: return False
         
         # Minimum notional check (Binance requires $5-$20 depending on pair)
-        if notional < 5.5:
+        if notional < MIN_NOTIONAL_USD:
             return False
 
         limit_price_str = f"{limit_price:.{prec['p_prec']}f}"
@@ -83,14 +96,16 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
                     break
                 elif lev_res and lev_res.status_code == 400:
                     continue
-            except: pass
+            except Exception as e:
+                log_error(f"Leverage set failed for {symbol}: {e}", include_traceback=False)
             
         if quantity <= 0: return False
         
         # Also attempt to set margin type to ISOLATED to avoid cross margin issues
         try:
             await binance_request(client, 'POST', '/fapi/v1/marginType', {"symbol": symbol, "marginType": "ISOLATED"})
-        except: pass
+        except Exception:
+            pass  # Expected to fail if already ISOLATED
 
         if quantity <= 0: return False
 
@@ -130,15 +145,17 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
                     tp_price = round_step(ref_price * tp_mult, prec["tick"])
                     tp_price_str = f"{tp_price:.{prec['p_prec']}f}"
 
-                    sl_res = await binance_request(client, 'POST', '/fapi/v1/order', {
+                    sl_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                        "algoType": "CONDITIONAL",
                         "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
-                        "type": "STOP_MARKET", "stopPrice": sl_price_str, 
+                        "type": "STOP_MARKET", "triggerPrice": sl_price_str, 
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
 
-                    tp_res = await binance_request(client, 'POST', '/fapi/v1/order', {
+                    tp_res = await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                        "algoType": "CONDITIONAL",
                         "symbol": symbol, "side": "SELL" if side == "BUY" else "BUY", 
-                        "type": "TAKE_PROFIT_MARKET", "stopPrice": tp_price_str, 
+                        "type": "TAKE_PROFIT_MARKET", "triggerPrice": tp_price_str, 
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
                     
@@ -172,7 +189,16 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
                     "regime": ai_brain.get("regime", "TRENDING"), 
                     "atr_pct": ai_brain.get("atr_pct", 0.5),
                     "active_features": list(ai_brain.get("active_features", [])),
+                    "brain_signals": list(ai_brain.get("brain_signals", [])),
                 }
+            asyncio.create_task(alert_open_position(
+                symbol, side, quantity,
+                execution_price if is_market else limit_price,
+                bot_state.get("_lev_cache", {}).get(symbol, MAX_LEVERAGE),
+                f"{'MARKET' if is_market else 'LIMIT'} | {signal_type}",
+                sl=f"{ai_brain.get('sl', 1.0):.2f}%",
+                tp=f"{ai_brain.get('tp', 2.0):.2f}%",
+            ))
             return True
         else:
             msg = res.json().get("msg", "Unknown") if res else "No Response"
@@ -184,13 +210,22 @@ async def open_position_async(client, symbol, side, signal_type, ai_brain):
         log_error(f"Limit Order Exception ({symbol}): {str(e)}")
         return False
 
-async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
+async def close_position_async(client: httpx.AsyncClient, symbol: str, side: str, amount: float, reason: str, pnl: float = 0.0) -> bool:
     try:
         prec = await get_symbol_precision(client, symbol)
         close_side = "SELL" if side == "LONG" else "BUY"
         
-        # 1. Cancel all open orders for this symbol first
+        # 1. Cancel all open orders (regular + algo) for this symbol
         await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": symbol})
+        # Cancel algo orders (SL/TP) - must cancel individually by algoId
+        algo_res = await binance_request(client, 'GET', '/fapi/v1/openAlgoOrders', {"symbol": symbol})
+        if algo_res and algo_res.status_code == 200:
+            algo_data = algo_res.json()
+            algo_list = algo_data.get('orders', algo_data) if isinstance(algo_data, dict) else algo_data
+            for ao in (algo_list if isinstance(algo_list, list) else []):
+                algo_id = ao.get('algoId')
+                if algo_id:
+                    await binance_request(client, 'DELETE', '/fapi/v1/algoOrder', {"symbol": symbol, "algoId": str(algo_id)})
         
         # 2. Place Market Close Order
         res = await binance_request(client, 'POST', '/fapi/v1/order', {
@@ -215,6 +250,12 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
             if active_feats:
                 update_feature_weights(active_feats, is_win)
 
+            # Scalping Brain accuracy feedback
+            from engine.scalping_brain import scalping_brain
+            brain_signals = trade_meta.get("brain_signals") or []
+            if brain_signals:
+                scalping_brain.update_accuracy(symbol, brain_signals, is_win)
+
             if is_win:
                 bot_state["wins"] = bot_state.get("wins", 0) + 1
             else:
@@ -230,6 +271,7 @@ async def close_position_async(client, symbol, side, amount, reason, pnl=0.0):
                 bot_state["sym_perf"][symbol]['c'] += 1
                 bot_state["sym_perf"][symbol]['last_loss_time'] = time.time()
             
+            asyncio.create_task(alert_close_position(symbol, side, pnl, pnl, reason))
             if symbol in bot_state["trades"]: del bot_state["trades"][symbol]
             return True
         return False
@@ -242,8 +284,8 @@ async def manage_limit_orders(client, all_signals):
         now = time.time()
         for symbol, lo in list(bot_state["limit_orders"].items()):
             age = now - lo["timestamp"]
-            # Cancel stale limit orders after 3 minutes (sniper needs time for pullback)
-            if age > 180:
+            # Cancel stale limit orders after 90 seconds (scalping needs fast entry)
+            if age > 90:
                 await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": lo["orderId"]})
                 del bot_state["limit_orders"][symbol]
                 bot_state["last_log"] = f"[dim]Cancelled stale limit for {symbol}[/]"
@@ -276,9 +318,11 @@ async def partial_close_async(client, symbol, side, full_amt, pct, reason, pnl):
         })
         if res and res.status_code == 200:
             bot_state["last_log"] = f"[bold green]PARTIAL {int(pct*100)}% {symbol} ({reason}) PnL:{pnl:+.2f}%[/]"
+            asyncio.create_task(alert_partial_close(symbol, pct, pnl, reason))
             return True
         return False
-    except:
+    except Exception as e:
+        log_error(f"Partial close failed for {symbol}: {e}")
         return False
 
 async def check_and_execute_exits(client, symbol, current_price, all_signals=[]):
@@ -326,14 +370,13 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         
         reason = None
         
-        # === 1. PARTIAL TAKE PROFIT (50% at TP1) ===
-        if not ai.get("partial_done") and pnl_pct >= max(initial_sl * 1.0, 0.6):
-            # Hit RR 1:1 (min 0.6% to cover fees) -> close 50% and let rest run
-            did_partial = await partial_close_async(client, symbol, side, amt, 0.5, "TP1 (RR1:1)", pnl_pct)
+        # === 1. PARTIAL TAKE PROFIT (40% at 0.6R for scalping) ===
+        if not ai.get("partial_done") and pnl_pct >= max(initial_sl * 0.6, 0.3):
+            did_partial = await partial_close_async(client, symbol, side, amt, 0.4, "TP1-SCALP", pnl_pct)
             if did_partial:
                 ai["partial_done"] = True
-                ai["be_active"] = True  # Activate breakeven for remainder
-                return False  # Don't full-close, let runner continue
+                ai["be_active"] = True
+                return False
         
         # === 2. STRUCTURE-BASED ADAPTIVE TRAILING ===
         trail_act = ai.get("ts_act", 0.8)
@@ -346,14 +389,14 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         curr_sig = next((s for s in all_signals if s["sym"] == sym_short), None) if all_signals else None
         if curr_sig and "ai" in curr_sig:
             ml_prob = curr_sig["ai"].get("ml_prob", 0.5)
-            # If ML says momentum weakening, tighten trail
+            # If ML says momentum weakening, tighten trail aggressively
             if side == "LONG" and ml_prob < 0.45:
-                ml_adj = 0.6
+                ml_adj = 0.4  # Very tight - protect profit
             elif side == "SHORT" and ml_prob > 0.55:
-                ml_adj = 0.6
-            # If ML says strong continuation, widen trail
+                ml_adj = 0.4
+            # If ML says strong continuation, widen trail slightly
             elif (side == "LONG" and ml_prob > 0.7) or (side == "SHORT" and ml_prob < 0.3):
-                ml_adj = 1.4
+                ml_adj = 1.3
         
         # Structure-aware callback: use ATR from live data
         struct_cb = base_cb
@@ -377,12 +420,14 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
             reason = f"AI-TRAIL {pnl_pct:.2f}% (CB:{struct_cb:.2f}%)"
         
         # === 3. BREAKEVEN PROTECTION (after partial or RR 1:1) ===
+        # Account for slippage+fees (~0.15%) when deciding breakeven
+        slippage_buffer = 0.15
         if not reason and ai.get("be_active"):
-            be_buffer = initial_sl * 0.5  # Give runner room to breathe
+            be_buffer = max(0.1, initial_sl * 0.15)  # Tight: protect at 0.1% above entry
             if pnl_pct <= be_buffer:
                 reason = "SMART-BE (Protecting profit)"
-        elif not reason and peak_pnl >= initial_sl and pnl_pct <= 0.1:
-            reason = "SMART-BE (Hit RR1:1 dropped)"
+        elif not reason and peak_pnl >= initial_sl * 0.7 and pnl_pct <= slippage_buffer:
+            reason = "SMART-BE (Profit evaporated)"
         
         # === 4. TIME DECAY - Exit stuck trades ===
         if not reason:
@@ -460,6 +505,88 @@ async def manage_active_positions(client, all_signals):
         pos_data = res.json()
         positions = [p for p in pos_data if float(p.get('positionAmt', 0)) != 0]
         
+        # --- RECONCILIATION: Detect positions closed by exchange (TP/SL hit) ---
+        # Compare bot_state["trades"] with actual Binance positions
+        active_symbols = {p['symbol'] for p in positions}
+        orphaned = [s for s in list(bot_state.get("trades", {}).keys()) if s not in active_symbols]
+        
+        for symbol in orphaned:
+            # Skip if recently closed by bot itself (avoid double-counting)
+            recently_closed = bot_state.get("_recently_closed", {})
+            if recently_closed.get(symbol, 0) > time.time() - 10:
+                continue
+            
+            trade_meta = bot_state["trades"][symbol]
+            entry_time = trade_meta.get("entry_time", 0)
+            side = trade_meta.get("side", "LONG")
+            
+            # Estimate PnL from last known mark price
+            last_price = market_data.prices.get(symbol, 0)
+            entry_price = trade_meta.get("peak", last_price)  # peak is set to entry on open for market orders
+            
+            # Try to get actual fill from recent trades API
+            pnl_pct = 0.0
+            try:
+                trades_res = await binance_request(client, 'GET', '/fapi/v1/userTrades', 
+                    {"symbol": symbol, "limit": 5})
+                if trades_res and trades_res.status_code == 200:
+                    user_trades = trades_res.json()
+                    # Find the closing trade (reduceOnly or opposite side)
+                    close_trades = [t for t in user_trades if float(t.get('realizedPnl', 0)) != 0]
+                    if close_trades:
+                        # Sum realized PnL from recent closing trades
+                        realized = sum(float(t['realizedPnl']) for t in close_trades 
+                                      if float(t['time'])/1000 > entry_time)
+                        if realized != 0:
+                            # Calculate PnL% from realized USDT
+                            qty = abs(float(close_trades[-1].get('qty', 1)))
+                            ep = float(close_trades[-1].get('price', last_price))
+                            notional = qty * ep
+                            pnl_pct = (realized / notional) * 100 if notional > 0 else 0
+            except Exception:
+                pass
+            
+            is_win = pnl_pct > 0
+            
+            # Update ML performance
+            ml_predictor.update_performance(symbol, is_win)
+            
+            # Feedback loop: features + brain signals
+            active_feats = trade_meta.get("active_features") or []
+            if active_feats:
+                update_feature_weights(active_feats, is_win)
+            
+            from engine.scalping_brain import scalping_brain
+            brain_signals = trade_meta.get("brain_signals") or []
+            if brain_signals:
+                scalping_brain.update_accuracy(symbol, brain_signals, is_win)
+            
+            # Update win/loss counters
+            if is_win:
+                bot_state["wins"] = bot_state.get("wins", 0) + 1
+            else:
+                bot_state["losses"] = bot_state.get("losses", 0) + 1
+            
+            if symbol not in bot_state.get("sym_perf", {}):
+                bot_state.setdefault("sym_perf", {})[symbol] = {'w': 0, 'l': 0, 'c': 0}
+            if is_win:
+                bot_state["sym_perf"][symbol]['w'] += 1
+                bot_state["sym_perf"][symbol]['c'] = 0
+            else:
+                bot_state["sym_perf"][symbol]['l'] += 1
+                bot_state["sym_perf"][symbol]['c'] = bot_state["sym_perf"][symbol].get('c', 0) + 1
+                bot_state["sym_perf"][symbol]['last_loss_time'] = time.time()
+            
+            reason = "EXCHANGE-TP/SL"
+            col = "green" if is_win else "red"
+            bot_state["last_log"] = f"[bold {col}]DETECTED CLOSE {symbol} ({reason}) | PnL: {pnl_pct:+.2f}%[/]"
+            asyncio.create_task(alert_close_position(symbol, side, pnl_pct, pnl_pct, reason))
+            
+            # Cleanup
+            del bot_state["trades"][symbol]
+            bot_state.setdefault("_recently_closed", {})[symbol] = time.time()
+            log_error(f"Reconciled orphan position {symbol}: closed by exchange (PnL: {pnl_pct:+.2f}%)", include_traceback=False)
+        
         if not positions:
             bot_state["logged_secure"] = []
             return []
@@ -467,10 +594,20 @@ async def manage_active_positions(client, all_signals):
         # Batch fetch ALL open orders once (instead of per-symbol)
         all_orders_res = await binance_request(client, 'GET', '/fapi/v1/openOrders')
         all_open_orders = all_orders_res.json() if all_orders_res and all_orders_res.status_code == 200 else []
+        # Also fetch algo orders (SL/TP are now placed via algo API)
+        algo_orders_res = await binance_request(client, 'GET', '/fapi/v1/openAlgoOrders')
+        all_algo_orders = []
+        if algo_orders_res and algo_orders_res.status_code == 200:
+            algo_data = algo_orders_res.json()
+            all_algo_orders = algo_data.get('orders', algo_data) if isinstance(algo_data, dict) else algo_data
         # Index by symbol for O(1) lookup
         orders_by_symbol = {}
         for o in all_open_orders:
             orders_by_symbol.setdefault(o['symbol'], []).append(o)
+        # Index algo orders by symbol
+        algo_by_symbol = {}
+        for o in (all_algo_orders if isinstance(all_algo_orders, list) else []):
+            algo_by_symbol.setdefault(o.get('symbol', ''), []).append(o)
         
         for p in positions:
             symbol, amt = p['symbol'], float(p['positionAmt'])
@@ -490,6 +627,7 @@ async def manage_active_positions(client, all_signals):
                         "type": ai.get("type", "INTRA"), "regime": ai.get("regime", "TRENDING"), 
                         "atr_pct": ai.get("atr_pct", 0.5),
                         "active_features": list(ai.get("active_features", [])),
+                        "brain_signals": list(ai.get("brain_signals", [])),
                     }
                 else:
                     bot_state["trades"][symbol] = {
@@ -508,8 +646,11 @@ async def manage_active_positions(client, all_signals):
 
             # 2. ORDER PROTECTION - use pre-fetched orders (no extra API call)
             symbol_orders = orders_by_symbol.get(symbol, [])
-            has_sl = any(o['type'] in ['STOP_MARKET', 'STOP'] for o in symbol_orders)
-            has_tp = any(o['type'] in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_orders)
+            symbol_algo = algo_by_symbol.get(symbol, [])
+            has_sl = (any(o['type'] in ['STOP_MARKET', 'STOP'] for o in symbol_orders) or
+                      any(o.get('orderType', o.get('type', '')) in ['STOP_MARKET', 'STOP'] for o in symbol_algo))
+            has_tp = (any(o['type'] in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_orders) or
+                      any(o.get('orderType', o.get('type', '')) in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_algo))
 
             # --- STRUCTURAL SL PROTECTION ---
             k1m = market_data.klines.get(symbol, {}).get("1m")
@@ -537,9 +678,20 @@ async def manage_active_positions(client, all_signals):
                         sl_order = next(o for o in symbol_orders if o['type'] in ['STOP_MARKET', 'STOP'])
                         await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": sl_order["orderId"]})
                     
-                    await binance_request(client, 'POST', '/fapi/v1/order', {
+                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                        "algoType": "CONDITIONAL",
                         "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
-                        "type": "STOP_MARKET", "stopPrice": f"{sl_price:.{prec['p_prec']}f}",
+                        "type": "STOP_MARKET", "triggerPrice": f"{sl_price:.{prec['p_prec']}f}",
+                        "closePosition": "true", "workingType": "MARK_PRICE"
+                    })
+
+                if not has_tp:
+                    tp_mult = (1 + (ai.get("tp", 2.0)/100)) if side == "LONG" else (1 - (ai.get("tp", 2.0)/100))
+                    tp_price = round_step(entry_price * tp_mult, prec["tick"])
+                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                        "algoType": "CONDITIONAL",
+                        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
+                        "type": "TAKE_PROFIT_MARKET", "triggerPrice": f"{tp_price:.{prec['p_prec']}f}",
                         "closePosition": "true", "workingType": "MARK_PRICE"
                     })
 

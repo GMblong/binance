@@ -14,6 +14,7 @@ from engine.depth_predictor import depth_predictor
 from engine.sentiment import sentiment_filter
 from engine.microstructure import micro_engine
 from engine.superhuman import superhuman
+from engine.scalping_brain import scalping_brain
 
 api_sem = asyncio.Semaphore(15)  # Higher concurrency for parallel analysis
 busy_symbols = set()
@@ -21,6 +22,53 @@ busy_symbols = set()
 # Analysis result cache - avoid re-analyzing if data hasn't changed
 _analysis_cache = {}  # {symbol: (last_kline_ot, result)}
 _indicator_cache = {}  # {(symbol, interval): (last_ot, indicators_dict)}
+
+
+def is_near_funding_settlement(buffer_minutes=10):
+    """Block/penalize entries near funding rate settlement (00:00, 08:00, 16:00 UTC)."""
+    now = datetime.utcnow()
+    minutes_in_day = now.hour * 60 + now.minute
+    for h in (0, 480, 960):  # 0:00, 8:00, 16:00 in minutes
+        diff = abs(minutes_in_day - h)
+        if diff > 720:
+            diff = 1440 - diff
+        if diff <= buffer_minutes:
+            return True
+    return False
+
+
+def is_spread_too_wide(symbol, max_spread_bps=15):
+    """Block entry if bid-ask spread > threshold (basis points)."""
+    quote = market_data.best_quote.get(symbol)
+    if not quote:
+        return False
+    _, best_bid, _, best_ask, _ = quote
+    if best_bid <= 0:
+        return False
+    spread_bps = ((best_ask - best_bid) / best_bid) * 10000
+    return spread_bps > max_spread_bps
+
+
+def get_oi_delta_signal(symbol):
+    """OI Delta Momentum: detect smart money positioning from OI + price change."""
+    oi_current = market_data.oi.get(symbol, 0)
+    oi_prev = market_data.prev_oi.get(symbol, 0)
+    if oi_prev == 0 or oi_current == 0:
+        return 0
+    oi_delta = (oi_current - oi_prev) / oi_prev
+    k = market_data.klines.get(symbol, {}).get("1m")
+    if k is None or len(k) < 5:
+        return 0
+    price_delta = (k['c'].iloc[-1] - k['c'].iloc[-5]) / k['c'].iloc[-5]
+    if oi_delta > 0.01 and price_delta > 0.001:
+        return 1   # New longs (bullish)
+    elif oi_delta > 0.01 and price_delta < -0.001:
+        return -1  # New shorts (bearish)
+    elif oi_delta < -0.01 and price_delta > 0.001:
+        return 0   # Short covering (neutral-ish)
+    elif oi_delta < -0.01 and price_delta < -0.001:
+        return 0   # Long liquidation (neutral-ish)
+    return 0
 
 async def get_btc_trend(client):
     try:
@@ -32,7 +80,8 @@ async def get_btc_trend(client):
             ema = MarketAnalyzer.get_ema(df["c"], 20).iloc[-1]
             bot_state["btc_state"] = "BULLISH" if df["c"].iloc[-1] > ema else "BEARISH"
             bot_state["btc_dir"] = 1 if df["c"].iloc[-1] > ema else -1
-    except: pass
+    except Exception as e:
+        log_error(f"BTC trend fetch error: {e}", include_traceback=False)
 
 async def analyze_hybrid_async(client, symbol):
     if symbol in busy_symbols: 
@@ -103,11 +152,24 @@ async def analyze_hybrid_async(client, symbol):
             
             # ADX filter: only trust EMA cross when trend is strong
             adx_val = MarketAnalyzer.get_adx(d15m, 14)
+            rsi_15m = MarketAnalyzer.get_rsi(d15m["c"], 14).iloc[-1]
+            is_reversal_trade = False
             if adx_val > 20:
-                direction = 1 if ema9_15m > ema21_15m else -1
+                ema_dir = 1 if ema9_15m > ema21_15m else -1
+                
+                # EXHAUSTION REVERSAL: trend sudah di ujung, ambil posisi reversal
+                # RSI extreme + EMA masih lagging = peluang scalp reversal
+                _rsi_1m_dir = MarketAnalyzer.get_rsi(d1m["c"], 14).iloc[-1]
+                if ema_dir == -1 and (rsi_15m < 35 or _rsi_1m_dir < 30):
+                    direction = 1   # Trend bearish exhausted → LONG (bounce)
+                    is_reversal_trade = True
+                elif ema_dir == 1 and (rsi_15m > 65 or _rsi_1m_dir > 70):
+                    direction = -1  # Trend bullish exhausted → SHORT (drop)
+                    is_reversal_trade = True
+                else:
+                    direction = ema_dir
             else:
                 # Weak trend: use RSI mean-reversion logic
-                rsi_15m = MarketAnalyzer.get_rsi(d15m["c"], 14).iloc[-1]
                 if rsi_15m < 35:
                     direction = 1  # Oversold = buy
                 elif rsi_15m > 65:
@@ -124,8 +186,10 @@ async def analyze_hybrid_async(client, symbol):
         ema20_1h = MarketAnalyzer.get_ema(d1h["c"], 20).iloc[-1] if len(d1h) >= 20 else price
         ema50_1h = MarketAnalyzer.get_ema(d1h["c"], 50).iloc[-1] if len(d1h) >= 50 else ema20_1h
         htf_direction = 1 if d1h["c"].iloc[-1] > ema50_1h else -1
-        # Multi-timeframe alignment: 15m direction must agree with 1h
-        mtf_aligned = (direction == htf_direction)
+        # Stricter MTF: check 1m RSI alignment too
+        rsi_1m = MarketAnalyzer.get_rsi(d1m["c"], 14).iloc[-1]
+        m1_aligned = (direction == 1 and rsi_1m > 45) or (direction == -1 and rsi_1m < 55)
+        mtf_aligned = (direction == htf_direction) and m1_aligned
         
         # --- INSTITUTIONAL DATA GATHERING ---
         imbalance = await get_orderbook_imbalance(client, symbol)
@@ -149,6 +213,21 @@ async def analyze_hybrid_async(client, symbol):
         # Penalize if 15m and 1h disagree (counter-trend = high risk)
         if not mtf_aligned:
             score = int(score * 0.6)  # 40% penalty for fighting HTF
+        
+        # --- FUNDING RATE TIMING FILTER ---
+        if is_near_funding_settlement(10):
+            score = int(score * 0.5)  # Heavy penalty near funding settlement
+        
+        # --- SPREAD FILTER ---
+        if is_spread_too_wide(symbol, max_spread_bps=15):
+            score = int(score * 0.4)  # Very wide spread = bad liquidity
+        
+        # --- OI DELTA MOMENTUM ---
+        oi_signal = get_oi_delta_signal(symbol)
+        if oi_signal == direction:
+            score = min(score + 10, 100)  # Smart money agrees
+        elif oi_signal == -direction:
+            score = max(score - 12, 0)  # Smart money disagrees
         
         # --- MACHINE LEARNING INTEGRATION ---
         # Predict UP probability (0.0 to 1.0)
@@ -248,6 +327,28 @@ async def analyze_hybrid_async(client, symbol):
         # --- MULTI-CANDLE FAKE MOVE DETECTION (3-candle sequence) ---
         if not is_fake_move and len(d1m) >= 5:
             is_fake_move = MarketAnalyzer.detect_multi_candle_fake(d1m, direction)
+        
+        # --- IMMEDIATE EMA POSITION PENALTY ---
+        _ema9_chk = MarketAnalyzer.get_ema(d1m['c'], 9).iloc[-1]
+        _ema21_chk = MarketAnalyzer.get_ema(d1m['c'], 21).iloc[-1]
+        if not is_reversal_trade:
+            if direction == 1 and price < _ema9_chk and price < _ema21_chk:
+                score = int(score * 0.7)
+            elif direction == -1 and price > _ema9_chk and price > _ema21_chk:
+                score = int(score * 0.7)
+        
+        # --- TREND EXHAUSTION PENALTY ---
+        # Don't SHORT when RSI already very low (trend exhausted, bounce imminent)
+        # Don't LONG when RSI already very high (trend exhausted, drop imminent)
+        _rsi_1m_chk = MarketAnalyzer.get_rsi(d1m['c'], 14).iloc[-1]
+        if direction == -1 and _rsi_1m_chk < 30:
+            score = int(score * 0.4)  # 60% penalty: shorting at exhaustion
+        elif direction == 1 and _rsi_1m_chk > 70:
+            score = int(score * 0.4)  # 60% penalty: buying at exhaustion
+        elif direction == -1 and rsi_15m < 35:
+            score = int(score * 0.5)  # 50% penalty: shorting oversold on 15m
+        elif direction == 1 and rsi_15m > 65:
+            score = int(score * 0.5)  # 50% penalty: buying overbought on 15m
         
         # --- WYCKOFF PHASE CONTEXT ---
         wyckoff = MarketAnalyzer.detect_wyckoff_phase(d15m)
@@ -493,12 +594,23 @@ async def analyze_hybrid_async(client, symbol):
             score = min(score + 8, 100)
             active_features.append(f"{regime}:price_disc")
 
+        # --- SCALPING BRAIN META-INTELLIGENCE (Bayesian fusion of ALL invisible signals) ---
+        brain = scalping_brain.compute(symbol, direction, regime, d1m, d15m, d1h)
+        score = min(max(score + brain["score_boost"], 0), 100)
+        if brain["n_signals"] >= 5:
+            active_features.append(f"{regime}:brain_confluence")
+        if brain["entry_quality"] > 0.7:
+            active_features.append(f"{regime}:brain_hq")
+
         # 2. Smart limit price placement
-        # Priority: Order Block > FVG > VWAP-area > EMA21 pullback
+        # Priority: Order Block > FVG > VWAP-area > Volume Profile POC > EMA21 pullback
         vwap_price = None
         if len(d1m) >= 60:
             tp = (d1m['h'] + d1m['l'] + d1m['c']) / 3
             vwap_price = (tp * d1m['v']).tail(60).sum() / d1m['v'].tail(60).sum()
+        
+        # Volume Profile POC from 15m data (stronger level)
+        vpoc = MarketAnalyzer.get_volume_profile(d15m, bins=30) if len(d15m) >= 20 else None
         
         if direction == 1:
             # LONG: place limit at support levels (below current price)
@@ -508,6 +620,8 @@ async def analyze_hybrid_async(client, symbol):
                 limit_p = fvg["top"]  # FVG fill level
             elif vwap_price and vwap_price < price and vwap_price > price * 0.98:
                 limit_p = vwap_price  # VWAP as dynamic support
+            elif vpoc and vpoc["poc"] < price and vpoc["poc"] > price * 0.97:
+                limit_p = vpoc["poc"]  # Volume POC as magnet support
             else:
                 # EMA21 pullback (deeper than EMA9 = better entry)
                 ema21_1m = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
@@ -520,6 +634,8 @@ async def analyze_hybrid_async(client, symbol):
                 limit_p = fvg["bottom"]  # FVG fill level
             elif vwap_price and vwap_price > price and vwap_price < price * 1.02:
                 limit_p = vwap_price
+            elif vpoc and vpoc["poc"] > price and vpoc["poc"] < price * 1.03:
+                limit_p = vpoc["poc"]  # Volume POC as magnet resistance
             else:
                 ema21_1m = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
                 limit_p = ema21_1m if ema21_1m > price else ema9_1m
@@ -557,7 +673,7 @@ async def analyze_hybrid_async(client, symbol):
         if micro["kurtosis"] > 5.0:
             sl_pct *= 1.1
         
-        sl_pct = max(0.4, min(sl_pct, 3.5))
+        sl_pct = max(0.6, min(sl_pct, 3.5))  # Min 0.6% SL to avoid premature stops
         
         # --- SMART TP: Structure-based targets + Liquidation Magnets ---
         # Base RR from regime
@@ -596,7 +712,8 @@ async def analyze_hybrid_async(client, symbol):
         
         # --- TRAILING STOP PARAMETERS (ML-adaptive) ---
         # Activation: earlier in trending, later in ranging
-        ts_act = sl_pct * 0.7 if regime == "TRENDING" else sl_pct * 0.9
+        ts_act = sl_pct * 0.4 if regime == "TRENDING" else sl_pct * 0.5
+        ts_act = max(0.2, ts_act)  # Min 0.2% activation
         # Callback: tighter when ML confident
         ts_cb = base_atr_pct * 0.5 if (ml_prob > 0.65 or ml_prob < 0.35) else base_atr_pct * 0.7
         ts_cb = max(0.15, min(ts_cb, sl_pct * 0.4))
@@ -616,12 +733,55 @@ async def analyze_hybrid_async(client, symbol):
             threshold = 82
         elif regime == "TRENDING":
             threshold = 68 if is_breakout else 75
+        
+        # Reversal scalps need lower threshold (by definition counter-trend)
+        if is_reversal_trade:
+            threshold = max(threshold - 15, 55)
             
         # --- ADAPTIVE EXECUTION ENGINE ---
         is_market_order = False
         
-        # Market orders ONLY for confirmed breakouts with extreme conviction
+        # Check score momentum (rising score = momentum building, don't miss)
+        prev_cached = _analysis_cache.get(symbol)
+        prev_score = prev_cached[1]["score"] if prev_cached and prev_cached[1] else 0
+        score_rising = (score - prev_score) >= 10 and prev_score >= 70  # Jumped 10+ from already-high
+        
+        # --- PULLBACK PROBABILITY ---
+        _pb_score = 0
+        if dist_from_ema21 > base_atr_pct * 1.5: _pb_score += 2
+        if (direction == 1 and rsi_1m > 70) or (direction == -1 and rsi_1m < 30): _pb_score += 2
+        if not vol_confirmed: _pb_score += 1
+        # Consecutive candles check (compute inline)
+        _last5c = d1m['c'].tail(5).values
+        _last5o = d1m['o'].tail(5).values
+        _greens = sum(1 for i in range(5) if _last5c[i] > _last5o[i])
+        _reds = sum(1 for i in range(5) if _last5c[i] < _last5o[i])
+        if (direction == 1 and _greens >= 4) or (direction == -1 and _reds >= 4): _pb_score += 2
+        if vol_confirmed and body_ratio > 0.6: _pb_score -= 2
+        if adx_val > 30: _pb_score -= 1
+        
+        pullback_likely = _pb_score >= 3  # High prob of pullback → use limit
+        no_pullback = _pb_score <= 0      # Low prob → use market, don't miss
+        
+        # Market orders for high-conviction signals that pass ALL filters
+        # 1. Classic breakout with extreme conviction
         if regime == "TRENDING" and is_breakout and score >= 85 and not is_fake_move:
+            is_market_order = True
+            limit_p = price
+        # 2. All filters pass + very high score = market order (don't miss the move)
+        elif score >= 88 and not is_fake_move and not is_overextended and vol_confirmed:
+            is_market_order = True
+            limit_p = price
+        # 3. MTF fully aligned + trending + strong score = market order
+        elif score >= 82 and mtf_aligned and regime == "TRENDING" and not is_fake_move and not is_overextended:
+            is_market_order = True
+            limit_p = price
+        # 4. Score rising fast (momentum building) + trending = market order
+        elif score_rising and score >= 80 and regime == "TRENDING" and not is_fake_move:
+            is_market_order = True
+            limit_p = price
+        # 5. No pullback expected + good score = market order (don't miss the move)
+        elif no_pullback and score >= 78 and not is_fake_move and not is_overextended:
             is_market_order = True
             limit_p = price
         # Everything else = limit order (sniper mode)
@@ -629,22 +789,82 @@ async def analyze_hybrid_async(client, symbol):
         signal = "WAIT"
         dist = abs(price - limit_p) / price * 100
         
+        # --- CANDLE FRESHNESS CHECK ---
+        # Only generate signal if last 1m candle is >45s old (data nearly final)
+        # Prevents acting on incomplete candle that may reverse before close
+        last_candle_age = (now * 1000 - d1m['ot'].iloc[-1]) / 1000  # seconds
+        candle_too_young = last_candle_age < 15  # First 15s of candle = unreliable
+        
+        # --- MOMENTUM CONFIRMATION (Anti-Falling-Knife) ---
+        # Don't BUY into consecutive red candles, don't SHORT into consecutive green
+        last5_closes = d1m['c'].tail(5).values
+        last5_opens = d1m['o'].tail(5).values
+        consec_red = sum(1 for i in range(len(last5_closes)) if last5_closes[i] < last5_opens[i])
+        consec_green = sum(1 for i in range(len(last5_closes)) if last5_closes[i] > last5_opens[i])
+        falling_knife = (direction == 1 and consec_red >= 4)  # 4/5 red candles = falling
+        rising_knife = (direction == -1 and consec_green >= 4)  # 4/5 green = pumping
+        
+        # For reversal trades: knife/cascading is CONFIRMATION not blocker
+        if is_reversal_trade:
+            falling_knife = False
+            rising_knife = False
+        
+        # Also check: is price making lower lows (for long) or higher highs (for short)?
+        last3_lows = d1m['l'].tail(3).values
+        last3_highs = d1m['h'].tail(3).values
+        cascading_down = (last3_lows[2] < last3_lows[1] < last3_lows[0]) and direction == 1 and not is_reversal_trade
+        cascading_up = (last3_highs[2] > last3_highs[1] > last3_highs[0]) and direction == -1 and not is_reversal_trade
+        
+        # --- SELL/BUY PRESSURE FILTER ---
+        # Block LONG if sellers dominate, block SHORT if buyers dominate
+        last10 = d1m.tail(10)
+        _sell_vol = last10[last10['c'] < last10['o']]['v'].sum()
+        _buy_vol = last10[last10['c'] >= last10['o']]['v'].sum()
+        sell_pressure = (direction == 1 and _sell_vol > _buy_vol * 1.3) and not is_reversal_trade
+        buy_pressure = (direction == -1 and _buy_vol > _sell_vol * 1.3) and not is_reversal_trade
+        
+        # --- RSI MOMENTUM DECLINING FILTER ---
+        # Block LONG if RSI declining and below 50, block SHORT if RSI rising and above 50
+        _rsi_vals = MarketAnalyzer.get_rsi(d15m['c'], 14)
+        _rsi_now = _rsi_vals.iloc[-1]
+        _rsi_prev = _rsi_vals.iloc[-3] if len(_rsi_vals) >= 3 else _rsi_now
+        rsi_declining_long = (direction == 1 and _rsi_now < _rsi_prev and _rsi_now < 48) and not is_reversal_trade
+        rsi_rising_short = (direction == -1 and _rsi_now > _rsi_prev and _rsi_now > 52) and not is_reversal_trade
+        
+        # --- EMA POSITION FILTER ---
+        # Penalize LONG if price below both EMA9+EMA21 on 1m (immediate bearish)
+        _ema9_pos = MarketAnalyzer.get_ema(d1m['c'], 9).iloc[-1]
+        _ema21_pos = MarketAnalyzer.get_ema(d1m['c'], 21).iloc[-1]
+        price_below_emas = (direction == 1 and price < _ema9_pos and price < _ema21_pos)
+        price_above_emas = (direction == -1 and price > _ema9_pos and price > _ema21_pos)
+        
         # Block entry if fake move or overextended
-        if is_fake_move or is_overextended:
+        if is_fake_move or is_overextended or candle_too_young:
             signal = "WAIT"
+        elif falling_knife or rising_knife:
+            signal = "WAIT"  # Don't catch falling knives
+        elif cascading_down or cascading_up:
+            signal = "WAIT"  # Price cascading against our direction
+        elif sell_pressure or buy_pressure:
+            signal = "WAIT"  # Opposing volume dominates
+        elif rsi_declining_long or rsi_rising_short:
+            signal = "WAIT"  # Momentum fading against our direction
+        # ML VETO: block entry if ML strongly disagrees with direction
+        elif (direction == 1 and ml_prob < 0.35) or (direction == -1 and ml_prob > 0.65):
+            signal = "WAIT"  # ML confidence >30% against direction = veto
         elif score >= threshold:
             # Limit order must be at a meaningful distance (not just chasing)
             if is_market_order:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-            elif dist >= 0.15 and dist <= 2.5:
-                # Good sniper distance: not too close (chasing), not too far (won't fill)
+            elif dist >= 0.10 and dist <= 2.5:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-            elif dist < 0.3:
-                # Too close - force limit deeper into structure
-                if direction == 1:
-                    limit_p = price * (1 - 0.003)  # Force 0.3% below
+            elif dist < 0.10:
+                # Very close to level — market order for reversal, limit for trend
+                if is_reversal_trade:
+                    is_market_order = True
+                    limit_p = price
                 else:
-                    limit_p = price * (1 + 0.003)  # Force 0.3% above
+                    limit_p = price * (1 - 0.002) if direction == 1 else price * (1 + 0.002)
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
         
         result = {
@@ -656,6 +876,7 @@ async def analyze_hybrid_async(client, symbol):
                 "type": "SCALP", "regime": regime, "score": int(score), "ml_prob": float(round(ml_prob, 2)),
                 "is_market": is_market_order, "atr_pct": float(base_atr_pct),
                 "active_features": list(active_features),
+                "brain_signals": brain.get("signals_fired", []),
             }
         }
         # Cache result keyed by last kline open time
