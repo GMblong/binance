@@ -127,66 +127,98 @@ async def send_control_panel():
 # ============================================================
 
 async def alert_open_position(symbol, side, qty, price, leverage, signal, sl=None, tp=None, details=None):
-    """Enhanced open alert with filter breakdown."""
+    """Compact card style alert."""
     coin = symbol.replace("USDT", "")
-    direction = "LONG" if side == "BUY" else "SHORT"
     icon = "🟢" if side == "BUY" else "🔴"
-    rows = [
-        f"Price|{price}",
-        f"Size|{qty}",
-        f"Leverage|{leverage}x",
-        f"Signal|{signal}",
-    ]
-    if sl: rows.append(f"SL|{sl}")
-    if tp: rows.append(f"TP|{tp}")
+    direction = "LONG" if side == "BUY" else "SHORT"
+    order_type = "MARKET" if "MARKET" in signal.upper() else "LIMIT"
+
+    lines = [f"{icon} <b>{direction}  {coin}</b>  •  {price}  •  {leverage}x  •  {order_type}"]
+    if sl and tp:
+        lines.append(f"\n<code>TP {tp}  │  SL {sl}  │  Size {qty}</code>")
 
     if details:
-        rows.append("---")
-        if details.get("ml_prob"):
-            rows.append(f"ML Conf|{details['ml_prob']:.0%}")
-        if details.get("score"):
-            rows.append(f"Score|{details['score']}/100")
-        if details.get("regime"):
-            rows.append(f"Regime|{details['regime']}")
-        if details.get("atr_pct"):
-            rows.append(f"ATR|{details['atr_pct']:.2f}%")
-        # Filters passed
+        ml = details.get("ml_prob", 0)
+        score = details.get("score", 0)
+        regime = details.get("regime", "")
+
+        conf_word = "Sangat Yakin" if ml >= 0.7 else ("Cukup Yakin" if ml >= 0.55 else "Spekulatif")
+        regime_map = {"TRENDING": "Trending", "RANGING": "Sideways", "VOLATILE": "Volatile"}
+
+        lines.append(f"\n🧠 {ml:.0%} {conf_word}  •  Skor {score}")
+        lines.append(f"📊 {regime_map.get(regime, regime)}")
+
         filters = details.get("filters_passed", [])
         if filters:
-            rows.append("---")
-            rows.append(f"✅ {' | '.join(filters)}")
-        # Brain signals
-        brain_sigs = details.get("brain_signals", [])
-        if brain_sigs:
-            rows.append(f"🧠 {' | '.join(brain_sigs[:4])}")
+            fmap = {
+                "htf_align": "Trend selaras", "micro_mom": "Momentum", "rsi_zone": "RSI ok",
+                "fvg": "FVG", "struct": "Struktur valid", "poc": "Area value",
+                "vsa": "Volume confirm", "hmm": "Pattern match", "ema_cross": "EMA cross",
+                "adx": "Trend kuat", "ob": "Order block", "liq_sweep": "Liq sweep",
+                "divergence": "Divergence", "oi_delta": "Smart money",
+            }
+            lines.append("✅ Alasan masuk:")
+            for f in filters[:6]:
+                name = fmap.get(f.split(":")[-1], f.split(":")[-1])
+                lines.append(f"  • {name}")
 
-    msg = _box(f"{direction}  {coin}/USDT", rows, icon)
-    await send_telegram(msg)
+        brain = details.get("brain_signals", [])
+        if brain:
+            bmap = {
+                "VPIN": "Flow toxic", "TIB": "Big player", "entropy": "Regime shift",
+                "absorption": "Whale absorb", "micro_mom": "Micro momentum",
+                "vol_compress": "Siap breakout", "liq_vacuum": "Liq tipis", "ofi": "Flow kuat",
+            }
+            lines.append("🧠 Sinyal pendukung:")
+            for b in brain[:4]:
+                name = bmap.get(b, b)
+                lines.append(f"  • {name}")
+
+    await send_telegram("\n".join(lines))
 
 
 async def alert_close_position(symbol, side, pnl, pnl_pct, reason, details=None):
-    """Enhanced close alert with specific analysis reason."""
+    """Compact card style close alert."""
     coin = symbol.replace("USDT", "")
-    icon = "💚" if pnl >= 0 else "❤️"
-    label = "WIN" if pnl >= 0 else "LOSS"
-    rows = [
-        f"PnL|{pnl_pct:+.2f}% (${pnl:+.2f})",
-        f"Reason|{reason}",
-    ]
+    is_win = pnl >= 0
+    icon = "💚" if is_win else "💔"
+    label = "PROFIT" if is_win else "RUGI"
+
+    lines = [f"{icon} <b>{label}  {coin}</b>  •  {side}  •  {pnl_pct:+.2f}%"]
+
+    # Translate reason
+    human_reason = reason
+    if "AI-REVERSAL" in reason:
+        human_reason = "AI deteksi arah berbalik"
+    elif "SMART-TP" in reason:
+        human_reason = "Momentum habis, ambil profit"
+    elif "DECAY-EXIT" in reason:
+        human_reason = "Terlalu lama sideways"
+    elif "TRAIL" in reason:
+        human_reason = "Trailing stop kena"
+    elif "BREAKEVEN" in reason:
+        human_reason = "Balik ke entry, keluar aman"
+    elif "BTC-DANGER" in reason:
+        human_reason = "BTC bahaya, keluar"
+    elif "TELEGRAM" in reason:
+        human_reason = "Ditutup manual"
+    elif "EXCHANGE" in reason:
+        human_reason = "TP/SL kena di exchange"
+    elif "PARTIAL" in reason:
+        human_reason = "Sebagian profit diamankan"
+
+    lines.append(f"\n📝 {human_reason}")
+
     if details:
-        rows.append("---")
+        info = []
         if details.get("duration"):
-            rows.append(f"Duration|{details['duration']}")
+            info.append(f"⏱ {details['duration']}")
         if details.get("max_pnl"):
-            rows.append(f"Max PnL|{details['max_pnl']:+.2f}%")
-        if details.get("exit_trigger"):
-            rows.append(f"Trigger|{details['exit_trigger']}")
-        if details.get("ml_exit_prob"):
-            rows.append(f"ML Exit|{details['ml_exit_prob']:.0%}")
-        if details.get("analysis"):
-            rows.append(f"Analysis|{details['analysis']}")
-    msg = _box(f"{label}  {coin}/USDT  {side}", rows, icon)
-    await send_telegram(msg)
+            info.append(f"📈 Max {details['max_pnl']:+.2f}%")
+        if info:
+            lines.append("  ".join(info))
+
+    await send_telegram("\n".join(lines))
 
 
 async def alert_kill_switch(daily_pnl_pct, balance):
@@ -209,7 +241,6 @@ async def alert_sentiment_pause(event=""):
 async def alert_startup(balance, positions):
     msg = _box("BOT ONLINE", [f"Balance|${balance:.2f}", f"Positions|{positions}", f"Time|{time.strftime('%H:%M UTC')}"], "🟢")
     await send_telegram(msg)
-    await send_control_panel()
 
 
 async def alert_shutdown():
@@ -223,8 +254,14 @@ async def alert_error(error):
 
 async def alert_partial_close(symbol, pct, pnl_pct, reason):
     coin = symbol.replace("USDT", "")
-    msg = _box(f"PARTIAL {int(pct*100)}%  {coin}", [f"PnL|{pnl_pct:+.2f}%", f"Reason|{reason}"], "✂️")
-    await send_telegram(msg)
+    lines = [f"✂️ <b>PARTIAL {int(pct*100)}%  {coin}</b>  •  {pnl_pct:+.2f}%"]
+    human_reason = "Sebagian profit diamankan"
+    if "TRAIL" in reason.upper():
+        human_reason = "Trailing partial"
+    elif "TP" in reason.upper():
+        human_reason = "Target partial tercapai"
+    lines.append(f"\n📝 {human_reason}")
+    await send_telegram("\n".join(lines))
 
 
 async def alert_limit_filled(symbol, side, price):
@@ -629,18 +666,7 @@ async def command_loop(bot_state, market_data, action_queue):
                 elif "Stop Bot" in clean or clean == "/stopbot":
                     await send_telegram("🛑 Stop bot?", _kb([[("✅ Yes", "stop_exec"), ("❌ No", "menu")]]))
                 elif "Start Bot" in clean or clean == "/startbot":
-                    import subprocess
-                    result = subprocess.run(["systemctl", "is-active", "trading-bot"], capture_output=True, text=True)
-                    if result.stdout.strip() == "active":
-                        await send_telegram("⚠️ Bot already running")
-                    else:
-                        subprocess.run(["systemctl", "start", "trading-bot"])
-                        await asyncio.sleep(3)
-                        result = subprocess.run(["systemctl", "is-active", "trading-bot"], capture_output=True, text=True)
-                        if result.stdout.strip() == "active":
-                            await send_telegram("🟢 <b>Bot Started</b>")
-                        else:
-                            await send_telegram("❌ Start failed — check journalctl")
+                    pass  # Bot already running, ignore (tg_watcher handles this when offline)
                 elif clean.startswith("/close "):
                     symbol = clean.split(" ", 1)[1].upper()
                     if not symbol.endswith("USDT"): symbol += "USDT"
