@@ -191,7 +191,10 @@ async def generate_dashboard_async(client):
             symbol = p['symbol']
             side = "LONG" if float(p['positionAmt']) > 0 else "SHORT"
             side_col = "green" if side == "LONG" else "red"
-            pnl = float(p['unRealizedProfit'])
+            pnl_raw = float(p['unRealizedProfit'])
+            notional = abs(float(p['positionAmt'])) * float(p['entryPrice'])
+            pnl = pnl_raw
+            pnl_pct = (pnl / notional * 100) if notional > 0 else 0
             pnl_col = "bold white on green" if pnl > 0 else "bold white on red"
             
             tp_sl_str = "[dim]-[/]"
@@ -282,9 +285,9 @@ async def generate_dashboard_async(client):
         # Calculate real-time equity and PnL
         total_unrealized_pnl = sum(float(p['unRealizedProfit']) for p in active_pos)
         
-        # Live Balance from bot_state
+        # Live Balance from bot_state (totalMarginBalance already includes unrealized PnL)
         curr_bal = bot_state.get("balance", 0.0)
-        display_bal = curr_bal + total_unrealized_pnl
+        display_bal = curr_bal
         
         # Breadth
         br_val = bot_state["alt_breadth"]

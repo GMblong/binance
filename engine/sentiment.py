@@ -160,7 +160,7 @@ class SentimentFilter:
                     'severity': 'HIGH', 'expires': now + 600
                 })
                 bot_state["last_log"] = f"[bold red]⚠ LIQ CASCADE: {sym} ${liq['total_usd']/1e6:.1f}M[/]"
-        except:
+        except Exception:
             pass
 
     def get_sentiment(self, symbol: str):

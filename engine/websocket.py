@@ -74,7 +74,8 @@ class WebSocketManager:
                         "id": int(time.time() * 1000) % 100000
                     }))
                 self.active_streams.update(to_subscribe)
-            except: pass
+            except Exception:
+                pass  # WS subscription failures are retried on next cycle
             
         if to_unsubscribe:
             try:
@@ -86,7 +87,8 @@ class WebSocketManager:
                         "id": int(time.time() * 1000) % 100000
                     }))
                 for s in to_unsubscribe: self.active_streams.discard(s)
-            except: pass
+            except Exception:
+                pass  # WS unsubscription failures are non-critical
 
     async def start(self, client):
         from engine.api import get_listen_key, keep_alive_listen_key
@@ -165,6 +167,10 @@ class WebSocketManager:
                                         
                                         # Update active_positions cache on Fill/Partial
                                         if status in ["FILLED", "PARTIALLY_FILLED"]:
+                                            # Alert limit order fills
+                                            if status == "FILLED" and o.get("o") == "LIMIT":
+                                                from utils.telegram import alert_limit_filled
+                                                asyncio.create_task(alert_limit_filled(sym, o.get("S", ""), o.get("L", o.get("p", ""))))
                                             # We trigger a background refresh to be 100% sure of the state
                                             async def refresh_pos():
                                                 from engine.api import binance_request
@@ -281,6 +287,14 @@ class WebSocketManager:
                                 elif "forceOrder" in stream_name:
                                     try:
                                         sentiment_filter.process_force_order(data)
+                                        # Alert large liquidations
+                                        from utils.telegram import alert_liquidation
+                                        o = data.get("o", {})
+                                        liq_sym = o.get("s", "")
+                                        liq_side = o.get("S", "")
+                                        liq_qty = float(o.get("q", 0))
+                                        liq_price = float(o.get("p", 0))
+                                        asyncio.create_task(alert_liquidation(liq_sym, liq_side, liq_qty, liq_price))
                                     except Exception:
                                         pass
 

@@ -1,0 +1,21 @@
+[project]
+name = "binance-futures-bot"
+version = "1.0.0"
+description = "Automated cryptocurrency futures trading bot with ML ensemble"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = [
+    "ignore::DeprecationWarning:pandas_ta",
+    "ignore::FutureWarning:pandas",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]  # Line too long (handled by formatter)

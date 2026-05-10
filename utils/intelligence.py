@@ -163,7 +163,7 @@ def get_symbol_correlation(sym1, sym2):
         
         corr = ret1.corr(ret2)
         return corr if not pd.isna(corr) else 0.5
-    except:
+    except Exception:
         return 0.5
 
 def is_correlated_exposure(new_symbol, new_side):
@@ -202,7 +202,7 @@ def calculate_kelly_risk(symbol, win_rate=0.5, rr=2.0):
         # Use Half-Kelly for safety and cap it between 0.5x and 1.5x of base risk
         multiplier = max(0.5, min(1.5, (kelly * 0.5) / 0.125)) # 0.125 is half-kelly for 50% WR/2RR
         return round(multiplier, 2)
-    except:
+    except Exception:
         return 1.0
 
 def detect_lead_lag(symbol, leader="BTCUSDT"):
@@ -260,7 +260,7 @@ def detect_lead_lag(symbol, leader="BTCUSDT"):
                     best_signal = signal
         
         return best_signal
-    except:
+    except Exception:
         return 0
 
 

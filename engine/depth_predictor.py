@@ -112,7 +112,7 @@ class DepthPredictor:
                 bid_real = prob + flow * 0.1
                 ask_real = prob - flow * 0.1
                 result = (max(0, min(1, bid_real)), max(0, min(1, ask_real)))
-            except:
+            except Exception:
                 result = (0.5, 0.5)
 
         self.predictions_cache[symbol] = (time.time(), result)

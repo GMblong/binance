@@ -3,7 +3,7 @@ import math
 import asyncio
 import httpx
 from typing import Optional
-from utils.config import ACCOUNT_RISK_PERCENT, MAX_LEVERAGE, EXIT_ON_REVERSAL, GLOBAL_BTC_EXIT, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_NOTIONAL_USD
+from utils.config import ACCOUNT_RISK_PERCENT, MAX_LEVERAGE, EXIT_ON_REVERSAL, GLOBAL_BTC_EXIT, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_NOTIONAL_USD, TAKER_FEE_PCT
 from utils.state import bot_state, market_data
 from utils.helpers import round_step
 from engine.api import binance_request, get_symbol_precision
@@ -12,6 +12,19 @@ from utils.telegram import alert_open_position, alert_close_position, alert_part
 from utils.intelligence import calculate_kelly_risk, update_feature_weights
 from engine.ml_engine import ml_predictor
 from strategies.analyzer import MarketAnalyzer
+
+
+def _fmt_duration(entry_time):
+    """Format trade duration as human-readable string."""
+    if not entry_time:
+        return "N/A"
+    secs = int(time.time() - entry_time)
+    if secs < 60:
+        return f"{secs}s"
+    elif secs < 3600:
+        return f"{secs // 60}m {secs % 60}s"
+    else:
+        return f"{secs // 3600}h {(secs % 3600) // 60}m"
 
 async def open_position_async(client: httpx.AsyncClient, symbol: str, side: str, signal_type: str, ai_brain: dict) -> bool:
     try:
@@ -198,6 +211,14 @@ async def open_position_async(client: httpx.AsyncClient, symbol: str, side: str,
                 f"{'MARKET' if is_market else 'LIMIT'} | {signal_type}",
                 sl=f"{ai_brain.get('sl', 1.0):.2f}%",
                 tp=f"{ai_brain.get('tp', 2.0):.2f}%",
+                details={
+                    "ml_prob": ai_brain.get("ml_prob", 0),
+                    "score": ai_brain.get("score", 0),
+                    "regime": ai_brain.get("regime", ""),
+                    "atr_pct": ai_brain.get("atr_pct", 0),
+                    "filters_passed": ai_brain.get("active_features", []),
+                    "brain_signals": ai_brain.get("brain_signals", []),
+                },
             ))
             return True
         else:
@@ -234,14 +255,16 @@ async def close_position_async(client: httpx.AsyncClient, symbol: str, side: str
         })
         
         if res and res.status_code == 200:
-            col = "green" if pnl > 0 else "red"
-            bot_state["last_log"] = f"[bold {col}]CLOSED {symbol} ({reason}) | Est. PnL: {pnl:+.2f}%[/]"
+            # pnl already accounts for fees from check_and_execute_exits
+            net_pnl = pnl
+            col = "green" if net_pnl > 0 else "red"
+            bot_state["last_log"] = f"[bold {col}]CLOSED {symbol} ({reason}) | PnL: {net_pnl:+.2f}%[/]"
             
             # Mark as recently closed so WebSocket doesn't double-count
             bot_state.setdefault("_recently_closed", {})[symbol] = time.time()
 
             # Update ML Predictor Performance (single source of truth)
-            is_win = pnl > 0
+            is_win = net_pnl > 0
             ml_predictor.update_performance(symbol, is_win)
 
             # Feedback loop: credit/penalize the features that fired at entry
@@ -271,7 +294,11 @@ async def close_position_async(client: httpx.AsyncClient, symbol: str, side: str
                 bot_state["sym_perf"][symbol]['c'] += 1
                 bot_state["sym_perf"][symbol]['last_loss_time'] = time.time()
             
-            asyncio.create_task(alert_close_position(symbol, side, pnl, pnl, reason))
+            asyncio.create_task(alert_close_position(symbol, side, net_pnl, net_pnl, reason, details={
+                "duration": _fmt_duration(trade_meta.get("entry_time", 0)),
+                "max_pnl": trade_meta.get("peak_pnl", 0),
+                "exit_trigger": reason,
+            }))
             if symbol in bot_state["trades"]: del bot_state["trades"][symbol]
             return True
         return False
@@ -350,14 +377,14 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         side = "LONG" if float(pos['positionAmt']) > 0 else "SHORT"
         amt = float(pos['positionAmt'])
         direction = 1 if side == "LONG" else -1
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100 * direction
+        pnl_pct = ((current_price - entry_price) / entry_price) * 100 * direction - TAKER_FEE_PCT
         
         # Update Peak
         if side == "LONG":
             ai["peak"] = max(ai.get("peak", current_price), current_price)
         else:
             ai["peak"] = min(ai.get("peak", current_price), current_price)
-        peak_pnl = abs((ai["peak"] - entry_price) / entry_price * 100)
+        peak_pnl = abs((ai["peak"] - entry_price) / entry_price * 100) - TAKER_FEE_PCT
         
         # Get market context
         k1m = market_data.klines.get(symbol, {}).get("1m")
@@ -546,6 +573,7 @@ async def manage_active_positions(client, all_signals):
             except Exception:
                 pass
             
+            pnl_pct -= TAKER_FEE_PCT
             is_win = pnl_pct > 0
             
             # Update ML performance
@@ -580,7 +608,10 @@ async def manage_active_positions(client, all_signals):
             reason = "EXCHANGE-TP/SL"
             col = "green" if is_win else "red"
             bot_state["last_log"] = f"[bold {col}]DETECTED CLOSE {symbol} ({reason}) | PnL: {pnl_pct:+.2f}%[/]"
-            asyncio.create_task(alert_close_position(symbol, side, pnl_pct, pnl_pct, reason))
+            asyncio.create_task(alert_close_position(symbol, side, pnl_pct, pnl_pct, reason, details={
+                "duration": _fmt_duration(trade_meta.get("entry_time", 0)),
+                "exit_trigger": "Exchange TP/SL hit",
+            }))
             
             # Cleanup
             del bot_state["trades"][symbol]

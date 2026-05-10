@@ -16,7 +16,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.align import Align
 
-from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_VOLUME_FILTER, CONSEC_LOSS_COOLDOWN_SEC, MAX_CONSEC_LOSSES, DB_SAVE_INTERVAL_SEC
+from utils.config import API_KEY, API_SECRET, API_URL, MAX_POSITIONS, USE_BTC_FILTER, DAILY_LOSS_LIMIT_PCT, DAILY_PROFIT_TARGET_PCT, MIN_VOLUME_FILTER, CONSEC_LOSS_COOLDOWN_SEC, MAX_CONSEC_LOSSES, DB_SAVE_INTERVAL_SEC, RETRAIN_ON_STARTUP
 from utils.state import bot_state, market_data
 from engine.websocket import ws_manager
 from engine.api import binance_request, get_balance_async, get_market_depth_data
@@ -31,7 +31,7 @@ from engine.auto_optimizer import auto_optimizer
 from engine.depth_predictor import depth_predictor
 from engine.sentiment import sentiment_filter
 from utils.logger import init_logger, log_error
-from utils.telegram import send_telegram, alert_kill_switch, alert_circuit_breaker, alert_sentiment_pause, alert_startup, alert_shutdown, alert_error, alert_daily_summary, alert_cooldown, command_loop
+from utils.telegram import send_telegram, alert_kill_switch, alert_circuit_breaker, alert_sentiment_pause, alert_startup, alert_shutdown, alert_error, alert_daily_summary, alert_cooldown, command_loop, proactive_alert_check
 
 console = Console()
 init_db()
@@ -62,11 +62,22 @@ async def trading_loop(client):
         market_data.tickers = tkr
         for t in tkr: market_data.prices[t["s"]] = t["c"]
         last_ticker_refresh = time.time()
-        # Pre-train top 15 coins by volume
+        # Pre-train/retrain top coins by volume
         top_by_vol = sorted(tkr, key=lambda x: x["q"], reverse=True)[:15]
         pretrain_symbols = [t["s"] for t in top_by_vol]
-        asyncio.create_task(ml_predictor.batch_pretrain(client, pretrain_symbols))
-        bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(pretrain_symbols)} models...[/]"
+        if RETRAIN_ON_STARTUP:
+            # Retrain all existing models + new top coins
+            existing = list(ml_predictor.models.keys())
+            all_symbols = list(set(pretrain_symbols + existing))
+            ml_predictor.last_trained.clear()  # Force retrain by clearing timestamps
+            asyncio.create_task(ml_predictor.batch_pretrain(client, all_symbols))
+            bot_state["last_log"] = f"[bold cyan]ML Retraining {len(all_symbols)} models (startup refresh)...[/]"
+        else:
+            # Only train coins that don't have models yet
+            new_symbols = [s for s in pretrain_symbols if s not in ml_predictor.models]
+            if new_symbols:
+                asyncio.create_task(ml_predictor.batch_pretrain(client, new_symbols))
+                bot_state["last_log"] = f"[bold cyan]ML Pre-training {len(new_symbols)} new models...[/]"
     
     while not shutdown_event.is_set():
         try:
@@ -143,6 +154,14 @@ async def trading_loop(client):
             filtered = [t for t in market_data.tickers if t["q"] > MIN_VOLUME_FILTER]
             top_symbols = screen_coins(filtered, top_n=30)
             
+            # Ensure active positions + limit orders always stay subscribed + analyzed
+            for p in bot_state.get("active_positions", []):
+                if p['symbol'] not in top_symbols:
+                    top_symbols.append(p['symbol'])
+            for s in bot_state.get("limit_orders", {}):
+                if s not in top_symbols:
+                    top_symbols.append(s)
+            
             # TURBO UI Placeholder
             placeholder_results = []
             for sym in top_symbols[:20]:
@@ -164,6 +183,12 @@ async def trading_loop(client):
             active_pos = await manage_active_positions(client, all_valid)
             await manage_limit_orders(client, all_valid)
             bot_state["active_positions"] = active_pos
+            
+            # Re-subscribe if manage_active_positions found new symbols (e.g. first loop after restart)
+            new_syms = [p['symbol'] for p in active_pos if p['symbol'] not in top_symbols]
+            if new_syms:
+                top_symbols.extend(new_syms)
+                await ws_manager.update_subscriptions(top_symbols)
             
             # Intelligence Metrics
             calculate_market_volatility()
@@ -333,6 +358,8 @@ async def trading_loop(client):
                 # 2. Batched DB Writes
                 await asyncio.to_thread(save_state_to_db)
                 bot_state["last_db_save"] = now
+                # Proactive Telegram alerts (drawdown, regime change, milestones)
+                asyncio.create_task(proactive_alert_check(bot_state, market_data))
 
             # 3. Hourly Summary to Telegram
             if loop_count % 2400 == 0:  # ~every hour (2400 loops * ~1.5s avg)

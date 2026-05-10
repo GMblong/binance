@@ -232,6 +232,7 @@ async def analyze_hybrid_async(client, symbol):
         # --- MACHINE LEARNING INTEGRATION ---
         # Predict UP probability (0.0 to 1.0)
         ml_prob = await ml_predictor.predict(client, symbol, d1m)
+        ml_has_model = symbol in ml_predictor.models
         ml_score_boost = 0
         ml_w = s_weights.get(f"{regime}:ml", 1.0) if s_weights else 1.0
 
@@ -249,6 +250,10 @@ async def analyze_hybrid_async(client, symbol):
                 ml_score_boost = int((0.6 - ml_prob) * 50 * ml_w) # Hasil negatif
         
         score = min(max(score + ml_score_boost, 0), 100)
+        
+        # Penalti jika ML model belum tersedia — cap score agar tidak bisa entry
+        if not ml_has_model:
+            score = min(score, 70)  # Max 70 tanpa ML = tidak bisa trigger entry (min 78)
         
         # --- LIQUIDATION MAGNET (M2) ---
         liq = MarketAnalyzer.predict_liquidation_clusters(d15m)

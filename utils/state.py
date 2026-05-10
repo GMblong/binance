@@ -2,50 +2,98 @@ import asyncio
 import pandas as pd
 import numpy as np
 import time
+import threading
+from typing import Optional, List, Tuple
 from collections import deque
 
-bot_state = {
-    "balance": 0.0,
-    "btc_trend": 0,
-    "btc_state": "INITIALIZING",
-    "btc_dir": 0, # 1: Long Only, -1: Short Only, 0: Both, -99: Locked
-    "last_log": "Initializing...",
-    "trades": {},
-    "ws_online": False,
-    "daily_pnl": 0.0,
-    "wins": 0,
-    "losses": 0,
-    "consec_losses": 0,
-    "last_loss_time": 0,
-    "state": "NORMAL", # NORMAL, FRAGILE, LOCKDOWN, DONE
-    "start_balance": 0.0,
-    "api_err_logged": False,
-    "logged_secure": [],
-    "alt_breadth": 0, # Percentage of bullish coins in scan list
-    "btc_dom": 50.0, # Bitcoin Dominance %
-    "ai_confidence": 1.0, # 1.0: Normal, >1.0: Conservative, <1.0: Aggressive
-    "liq_map": {}, # Store predicted liquidation clusters per symbol
-    "blacklist": {}, # {symbol: expiry_timestamp}
-    "active_positions": [], # Cached from API
-    "sym_perf": {}, # {symbol: {'w':0, 'l':0, 'c':0}} c=consec_loss
-    "ws_msg_count": 0,
-    "ws_last_msg": 0,
-    # Context-Aware Performance: { "REGIME:FEATURE": [wins, losses] }
-    "strat_perf": {}, 
-    # Context-Aware Weights: { "REGIME:FEATURE": weight }
-    "neural_weights": {},
-    "heartbeat": 0,
-    "limit_orders": {}, # {symbol: {orderId: ..., price: ..., side: ..., ai: ...}}
-    "is_passive": False, # If True, don't open new trades
-    "market_vol": 1.0, # Market-wide volatility index
-    "directional_bias": 0, # Net direction of current positions
-    "sym_weights": {}, # {symbol: {regime:feature: weight}}
-    "ui_active": False, # If True, keyboard listener is paused
-    "api_err_count": 0, # API Circuit Breaker counters
-    "api_req_count": 0,
-    "api_health_status": "OK", # OK, DEGRADED, BLOCKED
-    "last_db_save": 0, # Batched DB save timestamp
-}
+
+class BotState(dict):
+    """Thread-safe dict wrapper for bot state with default values.
+    
+    Provides safe access via .get() with defaults, and prevents KeyError
+    on missing keys by returning sensible defaults.
+    """
+    _lock = threading.Lock()
+
+    _DEFAULTS = {
+        "balance": 0.0,
+        "btc_trend": 0,
+        "btc_state": "INITIALIZING",
+        "btc_dir": 0,
+        "last_log": "Initializing...",
+        "trades": {},
+        "ws_online": False,
+        "daily_pnl": 0.0,
+        "wins": 0,
+        "losses": 0,
+        "consec_losses": 0,
+        "last_loss_time": 0,
+        "state": "NORMAL",
+        "start_balance": 0.0,
+        "api_err_logged": False,
+        "logged_secure": [],
+        "alt_breadth": 0,
+        "btc_dom": 50.0,
+        "ai_confidence": 1.0,
+        "liq_map": {},
+        "blacklist": {},
+        "active_positions": [],
+        "sym_perf": {},
+        "ws_msg_count": 0,
+        "ws_last_msg": 0,
+        "strat_perf": {},
+        "neural_weights": {},
+        "heartbeat": 0,
+        "limit_orders": {},
+        "is_passive": False,
+        "market_vol": 1.0,
+        "directional_bias": 0,
+        "sym_weights": {},
+        "ui_active": False,
+        "api_err_count": 0,
+        "api_req_count": 0,
+        "api_health_status": "OK",
+        "last_db_save": 0,
+    }
+
+    def __init__(self):
+        super().__init__(self._DEFAULTS)
+
+    def __missing__(self, key):
+        """Return None for missing keys instead of raising KeyError."""
+        return None
+
+    def safe_increment(self, key: str, amount: int = 1):
+        """Thread-safe increment for counters."""
+        with self._lock:
+            self[key] = self.get(key, 0) + amount
+
+    def snapshot_for_db(self) -> dict:
+        """Thread-safe snapshot of keys needed for DB save."""
+        with self._lock:
+            return {
+                "daily_pnl": self.get("daily_pnl", 0.0),
+                "wins": self.get("wins", 0),
+                "losses": self.get("losses", 0),
+                "ai_confidence": self.get("ai_confidence", 1.0),
+                "start_balance": self.get("start_balance", 0.0),
+                "_last_day": self.get("_last_day", ""),
+                "sym_perf": dict(self.get("sym_perf", {})),
+                "strat_perf": dict(self.get("strat_perf", {})),
+                "neural_weights": dict(self.get("neural_weights", {})),
+                "sym_weights": dict(self.get("sym_weights", {})),
+                "blacklist": dict(self.get("blacklist", {})),
+                "trades": dict(self.get("trades", {})),
+            }
+
+    def apply_db_load(self, data: dict):
+        """Thread-safe bulk update from DB load results."""
+        with self._lock:
+            for k, v in data.items():
+                self[k] = v
+
+
+bot_state = BotState()
 
 symbol_info_cache = {}
 
@@ -96,7 +144,7 @@ class MarketData:
             self.tick_buf[symbol] = tbuf
         tbuf.append((ts_sec, price, qty, sign))
 
-    def get_trades(self, symbol: str, window_sec: int = 60, max_items: int = 600):
+    def get_trades(self, symbol: str, window_sec: int = 60, max_items: int = 600) -> List[Tuple[float, float, float, float]]:
         """Return list of tick-level trades in window: [(ts, price, qty, sign), ...]
 
         Most-recent-first iteration is converted to chronological order.
@@ -113,7 +161,7 @@ class MarketData:
         out.reverse()
         return out
 
-    def get_live_cvd(self, symbol: str, window_sec: int = 60):
+    def get_live_cvd(self, symbol: str, window_sec: int = 60) -> Tuple[float, int]:
         """Return (cvd_sum_usd, n_trades) over the last `window_sec` seconds."""
         buf = self.cvd_buf.get(symbol)
         if not buf:
@@ -141,7 +189,7 @@ class MarketData:
         """Store best bid/ask + sizes for microprice calculation."""
         self.best_quote[symbol] = (time.time(), best_bid, best_bid_qty, best_ask, best_ask_qty)
 
-    def get_microprice(self, symbol: str):
+    def get_microprice(self, symbol: str) -> Optional[float]:
         """Size-weighted fair value: microprice = (bid*ask_qty + ask*bid_qty) / (bid_qty + ask_qty).
 
         More predictive than mid-price because it reflects the side with LESS
@@ -156,7 +204,7 @@ class MarketData:
             return None
         return (bb * baq + ba * bbq) / (bbq + baq)
 
-    def get_depth_velocity(self, symbol: str, window_sec: int = 10):
+    def get_depth_velocity(self, symbol: str, window_sec: int = 10) -> Tuple[float, float, float]:
         """Calculate rate of change in orderbook depth.
         
         Returns: (bid_velocity, ask_velocity, spoof_score)
@@ -198,7 +246,7 @@ class MarketData:
         
         return bid_vel, ask_vel, spoof_score
 
-    def detect_iceberg(self, symbol: str, window_sec: int = 30):
+    def detect_iceberg(self, symbol: str, window_sec: int = 30) -> Tuple[bool, bool]:
         """Detect iceberg orders: large hidden orders that refill at same price level.
         
         Pattern: top-of-book qty stays constant despite aggressive trades eating into it.
@@ -258,13 +306,12 @@ class MarketData:
         if new_ot == last_ot:
             # Update existing candle in-place (no lock needed for atomic writes)
             idx = len(df) - 1
-            ot_loc = df.columns.get_loc
-            df.iat[idx, ot_loc('o')] = new_candle['o']
-            df.iat[idx, ot_loc('h')] = new_candle['h']
-            df.iat[idx, ot_loc('l')] = new_candle['l']
-            df.iat[idx, ot_loc('c')] = new_candle['c']
-            df.iat[idx, ot_loc('v')] = new_candle['v']
-            df.iat[idx, ot_loc('tbv')] = new_candle['tbv']
+            df.iat[idx, df.columns.get_loc('o')] = new_candle['o']
+            df.iat[idx, df.columns.get_loc('h')] = new_candle['h']
+            df.iat[idx, df.columns.get_loc('l')] = new_candle['l']
+            df.iat[idx, df.columns.get_loc('c')] = new_candle['c']
+            df.iat[idx, df.columns.get_loc('v')] = new_candle['v']
+            df.iat[idx, df.columns.get_loc('tbv')] = new_candle['tbv']
         elif new_ot > last_ot:
             # New candle - need lock for structural change
             async with self.lock:

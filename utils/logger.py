@@ -9,7 +9,7 @@ def init_logger():
     try:
         with open(LOG_FILE, "w") as f:
             f.write(f"=== Bot Session Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-    except: pass
+    except Exception: pass
 
 def log_error(msg, include_traceback=True):
     """Logs an error message with timestamp and optional traceback."""
@@ -20,4 +20,4 @@ def log_error(msg, include_traceback=True):
             if include_traceback:
                 f.write(traceback.format_exc())
                 f.write("-" * 50 + "\n")
-    except: pass
+    except Exception: pass

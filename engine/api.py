@@ -2,12 +2,14 @@ import time
 import httpx
 import asyncio
 import urllib.parse
-from utils.config import API_URL, API_KEY, API_SECRET
+from typing import Optional
+from utils.config import API_URL, API_KEY, API_SECRET, API_BAN_SLEEP_SEC
 from utils.state import bot_state, symbol_info_cache, market_data
 from utils.helpers import get_signature
 from utils.logger import log_error
 
-async def binance_request(client, method, endpoint, params=None):
+
+async def binance_request(client: httpx.AsyncClient, method: str, endpoint: str, params: Optional[dict] = None) -> Optional[httpx.Response]:
     if bot_state.get("api_health_status") == "BLOCKED":
         return None # Circuit breaker active
         
@@ -39,7 +41,7 @@ async def binance_request(client, method, endpoint, params=None):
             elif res.status_code == 418:
                 bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                 bot_state["last_log"] = "[bold white on red] HARD BAN (418) - STOPPING 5 MIN [/]"
-                await asyncio.sleep(300)
+                await asyncio.sleep(API_BAN_SLEEP_SEC)
                 return None
             elif res.status_code >= 500:
                 bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
@@ -54,12 +56,13 @@ async def binance_request(client, method, endpoint, params=None):
                         # -4028: Leverage is not valid
                         # -4046: No need to change margin type
                         # -4509: TIF GTE (SL placement on empty pos)
-                        if err_code in [-4130, -4028, -4046, -4509]:
+                        # -4120: Order type not supported (handled by fallback)
+                        if err_code in [-4130, -4028, -4046, -4509, -4120]:
                             return res # Silent return
                         
                         bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
-                    except:
+                    except (ValueError, KeyError):
                         bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
                 else:
@@ -74,7 +77,7 @@ async def binance_request(client, method, endpoint, params=None):
             await asyncio.sleep(2 * (attempt + 1))
     return None
 
-async def get_symbol_precision(client, symbol):
+async def get_symbol_precision(client: httpx.AsyncClient, symbol: str) -> dict:
     if symbol in symbol_info_cache: return symbol_info_cache[symbol]
     try:
         res = await client.get(f"{API_URL}/fapi/v1/exchangeInfo")
@@ -105,7 +108,7 @@ async def get_symbol_precision(client, symbol):
         return {"tick": 0.01, "step": 0.001, "p_prec": 2, "q_prec": 3}
     return {"tick": 0.0001, "step": 0.1, "p_prec": 4, "q_prec": 1}
 
-async def get_listen_key(client):
+async def get_listen_key(client: httpx.AsyncClient) -> Optional[str]:
     try:
         res = await client.post(f"{API_URL}/fapi/v1/listenKey", headers={'X-MBX-APIKEY': API_KEY})
         if res.status_code == 200:
@@ -127,22 +130,22 @@ async def get_balance_async(client):
             return bot_state["balance"]
             
         data = res.json()
-        assets = data.get('assets', [])
         
-        # Find USDT with case-insensitive check
-        usdt_asset = next((a for a in assets if str(a['asset']).upper() == 'USDT'), None)
-        if usdt_asset:
-            # Try multiple possible keys returned by different Binance API versions
-            val_str = usdt_asset.get('walletBalance') or usdt_asset.get('availableBalance') or usdt_asset.get('balance', '0')
-            val = float(val_str)
-            
-            if val > 0:
-                bot_state["balance"] = val
-                # Critical: Ensure start_balance is never 0 if we have a real balance
-                if bot_state.get("start_balance", 0) <= 0:
-                    bot_state["start_balance"] = val
-            return val
-        return bot_state["balance"]
+        # Use totalMarginBalance (wallet + unrealized PnL) - matches Binance app display
+        val = float(data.get('totalMarginBalance', 0))
+        if val <= 0:
+            # Fallback to asset-level walletBalance
+            assets = data.get('assets', [])
+            usdt_asset = next((a for a in assets if str(a['asset']).upper() == 'USDT'), None)
+            if usdt_asset:
+                val_str = usdt_asset.get('walletBalance') or usdt_asset.get('availableBalance') or usdt_asset.get('balance', '0')
+                val = float(val_str)
+
+        if val > 0:
+            bot_state["balance"] = val
+            if bot_state.get("start_balance", 0) <= 0:
+                bot_state["start_balance"] = val
+        return val
     except Exception as e:
         bot_state["last_log"] = f"[red]Bal Parser Err: {str(e)[:15]}[/]"
         log_error(f"Balance Parser Exception: {str(e)}")
@@ -167,12 +170,14 @@ async def get_market_depth_data(client, symbols):
                     res_oi = await client.get(f"{API_URL}/fapi/v1/openInterest", params={"symbol": s})
                     if res_oi.status_code == 200:
                         market_data.oi[s] = float(res_oi.json()['openInterest'])
-                except: pass
+                except Exception:
+                    pass  # Non-critical: OI data is supplementary
                 
         tasks = [fetch_oi(s) for s in symbols]
         if tasks:
             await asyncio.gather(*tasks)
-    except: pass
+    except Exception as e:
+        log_error(f"Market depth data fetch error: {e}", include_traceback=False)
 
 last_imbalance_fetch = {}
 
@@ -223,4 +228,5 @@ async def get_btc_dominance(client):
             # We just need the direction/relative value
             val = float(res.json()['price'])
             bot_state["btc_dom"] = val
-    except: pass
+    except Exception:
+        pass  # Non-critical: BTC dominance is supplementary

@@ -1,16 +1,16 @@
 import os
 
-API_URL = "https://fapi.binance.com"
-ACCOUNT_RISK_PERCENT = 0.02  
-MAX_POSITIONS = 3            
-MAX_LEVERAGE = 20
-            
-USE_BTC_FILTER = False
-EXIT_ON_REVERSAL = True 
-GLOBAL_BTC_EXIT = False 
-
-DAILY_PROFIT_TARGET_PCT = 0.10  # 10% Profit Target
-DAILY_LOSS_LIMIT_PCT = 0.05    # 5% Loss Limit
+# --- Trading Constants ---
+MIN_NOTIONAL_USD = 5.5          # Binance minimum order value
+MIN_VOLUME_FILTER = 5_000_000   # Minimum 24h quote volume for scanning
+MIN_VOLUME_SCREENER = 10_000_000  # Minimum volume for coin screener
+TAKER_FEE_PCT = 0.08  # Round-trip taker fee (0.04% open + 0.04% close)
+CONSEC_LOSS_COOLDOWN_SEC = 3600   # 60 min cooldown after 3 consecutive losses
+MAX_CONSEC_LOSSES = 3             # Trigger cooldown after N losses
+ML_RETRAIN_INTERVAL_SEC = 7200    # 2h between ML model retrains (scalping needs fresh models)
+API_BAN_SLEEP_SEC = 300           # Sleep duration on 418 hard ban
+KLINE_MAX_CANDLES = 300           # Max candles to keep in memory
+DB_SAVE_INTERVAL_SEC = 30         # Batched DB write interval
 
 def load_env():
     keys = {}
@@ -21,7 +21,8 @@ def load_env():
                     if "=" in line:
                         k, v = line.strip().split("=", 1)
                         keys[k] = v
-    except: pass
+    except (IOError, OSError):
+        pass
     return keys
 
 env = load_env()
@@ -37,3 +38,4 @@ EXIT_ON_REVERSAL = env.get("EXIT_ON_REVERSAL", "True").lower() == "true"
 GLOBAL_BTC_EXIT = env.get("GLOBAL_BTC_EXIT", "False").lower() == "true"
 DAILY_LOSS_LIMIT_PCT = float(env.get("DAILY_LOSS_LIMIT_PCT", 0.05))
 DAILY_PROFIT_TARGET_PCT = float(env.get("DAILY_PROFIT_TARGET_PCT", 0.10))
+RETRAIN_ON_STARTUP = env.get("RETRAIN_ON_STARTUP", "True").lower() == "true"

@@ -169,7 +169,7 @@ class MarketAnalyzer:
             
             current_state = _hmm_forward(returns, trans, means, stds)
             return "MEAN_REVERT" if current_state == 0 else "MOMENTUM"
-        except:
+        except Exception:
             return "UNKNOWN"
     @staticmethod
     def get_ema(series, length):
@@ -201,7 +201,7 @@ class MarketAnalyzer:
             l = df['l'].values.astype(np.float64)
             c = df['c'].values.astype(np.float64)
             return float(_adx_loop(h, l, c, length))
-        except:
+        except Exception:
             return 25
 
     @staticmethod
@@ -238,7 +238,7 @@ class MarketAnalyzer:
             va_low = price_min + (min(va_bins) * bin_size)
             
             return {"poc": poc_price, "vah": va_high, "val": va_low}
-        except: return None
+        except Exception: return None
 
     @staticmethod
     def detect_vsa_signals(df):
@@ -288,7 +288,7 @@ class MarketAnalyzer:
                 return 1
 
             return 0
-        except: return 0
+        except Exception: return 0
 
     @staticmethod
     def detect_regime(df):
@@ -318,7 +318,7 @@ class MarketAnalyzer:
             curr_dist = dist[-1]
             if dist_std > 0 and abs(curr_dist) > dist_std * 1.2: return "TRENDING"
             return "RANGING"
-        except: return "RANGING"
+        except Exception: return "RANGING"
 
     @staticmethod
     def detect_wyckoff_phase(df):
@@ -374,7 +374,7 @@ class MarketAnalyzer:
             if range_tightening:
                 return "ACCUMULATION" if position < 0.4 else "DISTRIBUTION" if position > 0.6 else "UNKNOWN"
             return "UNKNOWN"
-        except:
+        except Exception:
             return "UNKNOWN"
 
     @staticmethod
@@ -452,7 +452,7 @@ class MarketAnalyzer:
                     return True
             
             return False
-        except:
+        except Exception:
             return False
 
     @staticmethod
@@ -487,7 +487,7 @@ class MarketAnalyzer:
                 return "BEARISH", False, recent_high, recent_low
                 
             return "CHOP", False, recent_high, recent_low
-        except: return "CHOP", False, None, None
+        except Exception: return "CHOP", False, None, None
 
     @staticmethod
     def calculate_score(d1m, d15m, direction, imbalance=1.0, funding=0.0, regime="RANGING", neural_weights=None, session="QUIET", lead_lag=0, return_features=False):
@@ -647,7 +647,7 @@ class MarketAnalyzer:
             if return_features:
                 return final, active
             return final
-        except:
+        except Exception:
             if return_features:
                 return 0, []
             return 0
@@ -671,7 +671,7 @@ class MarketAnalyzer:
             if curr_h > prev_high and curr_c < prev_high:
                 return -1
             return 0
-        except: return 0
+        except Exception: return 0
 
     @staticmethod
     def get_structure_levels(df):
@@ -713,7 +713,7 @@ class MarketAnalyzer:
                                 break
                         if not mitigated:
                             return {"top": ob_top, "bottom": ob_bottom, "type": "BEARISH"}
-        except: return None
+        except Exception: return None
         return None
 
     @staticmethod
@@ -737,7 +737,7 @@ class MarketAnalyzer:
                 clusters["short_liq"].append(recent_low * (1 + margin))
                 
             return clusters
-        except: return None
+        except Exception: return None
     
     @staticmethod
     def detect_volatility_breakout(df):
@@ -746,7 +746,7 @@ class MarketAnalyzer:
             atr = MarketAnalyzer.get_atr(df, 14)
             current_range = df['h'].iloc[-1] - df['l'].iloc[-1]
             return current_range > (atr.iloc[-2] * 2) 
-        except: return False
+        except Exception: return False
 
     @staticmethod
     def detect_rsi_divergence(df):
@@ -775,7 +775,7 @@ class MarketAnalyzer:
                 return -1 # Bearish Divergence
                 
             return 0
-        except: return 0
+        except Exception: return 0
 
     @staticmethod
     def detect_volume_anomaly(df):
@@ -783,7 +783,7 @@ class MarketAnalyzer:
             if len(df) < 20: return False
             vol_sma = df['v'].rolling(window=20).mean()
             return df['v'].iloc[-1] > (vol_sma.iloc[-2] * 2.5) 
-        except: return False
+        except Exception: return False
 
     @staticmethod
     def fractal_dimension(df, n: int = 30) -> float:
@@ -813,7 +813,7 @@ class MarketAnalyzer:
             y = np.array([p[1] for p in lk])
             slope = np.polyfit(x, y, 1)[0]
             return float(max(1.0, min(2.0, slope)))
-        except:
+        except Exception:
             return 1.5
 
     @staticmethod
@@ -840,8 +840,44 @@ class MarketAnalyzer:
                 return 1.0
             vr = var_k / (period * var1)
             return float(vr)
-        except:
+        except Exception:
             return 1.0
+
+    @staticmethod
+    def get_volume_profile(df, bins=30):
+        """Calculate Volume Profile POC (Point of Control) and Value Area."""
+        try:
+            if len(df) < 10:
+                return None
+            price_min, price_max = df['l'].min(), df['h'].max()
+            if price_max <= price_min:
+                return None
+            edges = np.linspace(price_min, price_max, bins + 1)
+            vol_at_price = np.zeros(bins)
+            for i in range(len(df)):
+                row_l, row_h, row_v = df['l'].iloc[i], df['h'].iloc[i], df['v'].iloc[i]
+                mask = (edges[:-1] <= row_h) & (edges[1:] >= row_l)
+                cnt = mask.sum()
+                if cnt > 0:
+                    vol_at_price[mask] += row_v / cnt
+            poc_idx = int(np.argmax(vol_at_price))
+            poc_price = (edges[poc_idx] + edges[poc_idx + 1]) / 2
+            # Value Area (70% volume)
+            total_vol = vol_at_price.sum()
+            if total_vol == 0:
+                return None
+            sorted_idx = np.argsort(vol_at_price)[::-1]
+            cum_vol, va_indices = 0.0, []
+            for idx in sorted_idx:
+                cum_vol += vol_at_price[idx]
+                va_indices.append(idx)
+                if cum_vol >= total_vol * 0.7:
+                    break
+            va_high = edges[max(va_indices) + 1]
+            va_low = edges[min(va_indices)]
+            return {"poc": float(poc_price), "vah": float(va_high), "val": float(va_low)}
+        except Exception:
+            return None
 
     @staticmethod
     def detect_sweep(df): return False
@@ -872,5 +908,5 @@ class MarketAnalyzer:
                             break
                     if not mitigated:
                         return {"top": fvg_top, "bottom": fvg_bottom, "type": "BEARISH"}
-        except: return None
+        except Exception: return None
         return None
