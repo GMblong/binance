@@ -121,9 +121,10 @@ class MarketData:
         self.best_quote = {}  # {symbol: (ts, best_bid, best_bid_qty, best_ask, best_ask_qty)}
         # Microstructure alpha cache (computed periodically, read by strategy)
         self.micro_alpha = {}  # {symbol: {features_dict, ts}}
+        self.last_rest_fetch = {}  # {symbol: ts} to prevent rate limit spam
         self.lock = asyncio.Lock()
 
-    def push_agg_trade(self, symbol: str, ts_sec: float, qty: float, price: float, is_buyer_maker: bool, max_keep: int = 600):
+    def push_agg_trade(self, symbol: str, ts_sec: float, qty: float, price: float, is_buyer_maker: bool, max_keep: int = 5000):
         """Append a signed quote-volume delta from an aggTrade event.
 
         Also populates tick_buf (richer info: price + qty + sign) used by the
@@ -140,19 +141,27 @@ class MarketData:
         # Tick-level buffer for microstructure calculations
         tbuf = self.tick_buf.get(symbol)
         if tbuf is None:
-            tbuf = deque(maxlen=max_keep * 3)  # keep more ticks (~1800)
+            tbuf = deque(maxlen=max_keep * 2)  # keep more ticks (~10000)
             self.tick_buf[symbol] = tbuf
         tbuf.append((ts_sec, price, qty, sign))
 
-    def get_trades(self, symbol: str, window_sec: int = 60, max_items: int = 600) -> List[Tuple[float, float, float, float]]:
+    def get_trades(self, symbol: str, window_sec: int = 60, max_items: int = 5000) -> List[Tuple[float, float, float, float]]:
         """Return list of tick-level trades in window: [(ts, price, qty, sign), ...]
 
-        Most-recent-first iteration is converted to chronological order.
+        Uses the most recent trade's timestamp as the 'now' reference to handle clock drift.
         """
         buf = self.tick_buf.get(symbol)
         if not buf:
             return []
-        cutoff = time.time() - window_sec
+        
+        # Use latest trade timestamp as reference point to avoid clock desync issues
+        now_exchange = buf[-1][0]
+        
+        # Safety: if the latest trade is older than 5 minutes, the window is stale
+        if time.time() - now_exchange > 300:
+            return []
+
+        cutoff = now_exchange - window_sec
         out = []
         for row in reversed(buf):
             if row[0] < cutoff or len(out) >= max_items:
@@ -166,7 +175,12 @@ class MarketData:
         buf = self.cvd_buf.get(symbol)
         if not buf:
             return 0.0, 0
-        cutoff = time.time() - window_sec
+            
+        now_exchange = buf[-1][0]
+        if time.time() - now_exchange > 300:
+            return 0.0, 0
+
+        cutoff = now_exchange - window_sec
         total = 0.0
         n = 0
         for ts, delta in reversed(buf):

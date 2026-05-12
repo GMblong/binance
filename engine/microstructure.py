@@ -17,14 +17,32 @@ class MicrostructureEngine:
         self._cache = {}  # {symbol: (ts, features_dict)}
         self._cache_ttl = 1.5  # seconds
 
-    def compute(self, symbol: str, window_sec: int = 60) -> dict:
+    async def compute(self, symbol: str, window_sec: int = 60, client=None) -> dict:
         """Compute all 12 microstructure features. Returns dict or cached."""
         cached = self._cache.get(symbol)
         if cached and time.time() - cached[0] < self._cache_ttl:
             return cached[1]
 
-        trades = market_data.get_trades(symbol, window_sec=window_sec, max_items=600)
+        trades = market_data.get_trades(symbol, window_sec=window_sec, max_items=2000)
         n = len(trades)
+
+        # SMART REST Fallback: Only warmup ONCE on startup or if WS is dead for > 5 mins
+        now = time.time()
+        last_fetch = market_data.last_rest_fetch.get(symbol, 0)
+        
+        if n < 20 and client and (now - last_fetch > 300):
+            market_data.last_rest_fetch[symbol] = now
+            from engine.api import fetch_recent_trades
+            # Only fetch 300 trades to keep weight low (10-20 weight per call)
+            rest_trades = await fetch_recent_trades(client, symbol, limit=300)
+            if rest_trades:
+                for t in rest_trades:
+                    market_data.push_agg_trade(
+                        symbol, float(t['T'])/1000.0, 
+                        float(t['q']), float(t['p']), t['m']
+                    )
+                trades = market_data.get_trades(symbol, window_sec=window_sec, max_items=2000)
+                n = len(trades)
 
         result = {
             "vpin": 0.0,        # Volume-sync Probability of Informed Trading
@@ -47,6 +65,7 @@ class MicrostructureEngine:
 
         if n < 20:
             self._cache[symbol] = (time.time(), result)
+            market_data.micro_alpha[symbol] = result
             return result
 
         prices = np.array([t[1] for t in trades])

@@ -31,13 +31,14 @@ class MLPredictor:
         self.performance = {}
         self.feature_importance = {}
         self.feature_cache = {}
-        self.retrain_sem = asyncio.Semaphore(4)
+        # INCREASED CONCURRENCY: Allow 16 models to train in parallel
+        self.retrain_sem = asyncio.Semaphore(16)
         self.startup_done = False
         self._retraining = set()
         self.trades_since_train = {}
         self.last_drift_check = {}
         self._pred_cache = {}
-        self._pred_cache_ttl = 5.0
+        self._pred_cache_ttl = 2.0
         self._load_all_models()
 
     def _load_all_models(self):
@@ -128,7 +129,7 @@ class MLPredictor:
         features.extend([col for col in df_cols if 'MACD' in col])
         return features
 
-    def feature_engineering(self, df):
+    def feature_engineering(self, df, fast=False):
         is_training = len(df) > 200
 
         df['ema_9'] = ta.ema(df['c'], length=9)
@@ -193,47 +194,88 @@ class MLPredictor:
         )
 
         # --- TRADING ANALYSIS SIGNALS AS ML FEATURES ---
-        # Structure: detect HH/HL (bullish=1) vs LH/LL (bearish=-1)
-        struct_dir, _, _, _ = MarketAnalyzer.detect_structure(df)
-        df['structure'] = 1.0 if struct_dir == "BULLISH" else (-1.0 if struct_dir == "BEARISH" else 0.0)
+        # Fixed Leakage: During training, we must compute these rolling or avoid using them if too slow.
+        # For prediction (not is_training), we calculate only for the last bar.
+        if not is_training:
+            # Structure: detect HH/HL (bullish=1) vs LH/LL (bearish=-1)
+            struct_dir, _, _, _ = MarketAnalyzer.detect_structure(df)
+            df['structure'] = 1.0 if struct_dir == "BULLISH" else (-1.0 if struct_dir == "BEARISH" else 0.0)
 
-        # RSI Divergence: bullish=1, bearish=-1, none=0
-        df['divergence'] = float(MarketAnalyzer.detect_rsi_divergence(df))
+            # RSI Divergence: bullish=1, bearish=-1, none=0
+            df['divergence'] = float(MarketAnalyzer.detect_rsi_divergence(df))
 
-        # VSA (Volume Spread Analysis): buy=1, sell=-1, neutral=0
-        df['vsa'] = float(MarketAnalyzer.detect_vsa_signals(df))
+            # VSA (Volume Spread Analysis): buy=1, sell=-1, neutral=0
+            df['vsa'] = float(MarketAnalyzer.detect_vsa_signals(df))
 
-        # Liquidity sweep: swept lows=1 (bullish), swept highs=-1 (bearish)
-        df['liq_sweep'] = float(MarketAnalyzer.detect_liquidity_sweep(df))
+            # Liquidity sweep: swept lows=1 (bullish), swept highs=-1 (bearish)
+            df['liq_sweep'] = float(MarketAnalyzer.detect_liquidity_sweep(df))
 
-        # Order block proximity: 1 if near OB in direction, 0 otherwise
-        last_price = df['c'].iloc[-1]
-        ob_bull = MarketAnalyzer.find_nearest_order_block(df, last_price, 1)
-        ob_bear = MarketAnalyzer.find_nearest_order_block(df, last_price, -1)
-        df['ob_near'] = 1.0 if ob_bull else (-1.0 if ob_bear else 0.0)
+            # Order block proximity: 1 if near OB in direction, 0 otherwise
+            last_price = df['c'].iloc[-1]
+            ob_bull = MarketAnalyzer.find_nearest_order_block(df, last_price, 1)
+            ob_bear = MarketAnalyzer.find_nearest_order_block(df, last_price, -1)
+            df['ob_near'] = 1.0 if ob_bull else (-1.0 if ob_bear else 0.0)
 
-        # FVG (Fair Value Gap): bullish=1, bearish=-1, none=0
-        fvg = MarketAnalyzer.get_nearest_fvg(df)
-        df['fvg'] = (1.0 if fvg and fvg["type"] == "BULLISH" else
-                     (-1.0 if fvg and fvg["type"] == "BEARISH" else 0.0))
+            # FVG (Fair Value Gap): bullish=1, bearish=-1, none=0
+            fvg = MarketAnalyzer.get_nearest_fvg(df)
+            df['fvg'] = (1.0 if fvg and fvg["type"] == "BULLISH" else
+                         (-1.0 if fvg and fvg["type"] == "BEARISH" else 0.0))
 
-        # Wyckoff phase: ACCUMULATION=1, MARKUP=2, DISTRIBUTION=-1, MARKDOWN=-2
-        wyckoff = MarketAnalyzer.detect_wyckoff_phase(df)
-        wyckoff_map = {"ACCUMULATION": 1.0, "MARKUP": 2.0, "DISTRIBUTION": -1.0, "MARKDOWN": -2.0}
-        df['wyckoff'] = wyckoff_map.get(wyckoff, 0.0)
+            # Wyckoff phase: ACCUMULATION=1, MARKUP=2, DISTRIBUTION=-1, MARKDOWN=-2
+            wyckoff = MarketAnalyzer.detect_wyckoff_phase(df)
+            wyckoff_map = {"ACCUMULATION": 1.0, "MARKUP": 2.0, "DISTRIBUTION": -1.0, "MARKDOWN": -2.0}
+            df['wyckoff'] = wyckoff_map.get(wyckoff, 0.0)
 
-        # Volume anomaly: 1 if abnormal volume detected
-        df['vol_anomaly'] = 1.0 if MarketAnalyzer.detect_volume_anomaly(df) else 0.0
+            # Volume anomaly: 1 if abnormal volume detected
+            df['vol_anomaly'] = 1.0 if MarketAnalyzer.detect_volume_anomaly(df) else 0.0
 
-        # Volatility breakout: 1 if breaking out
-        df['vol_breakout'] = 1.0 if MarketAnalyzer.detect_volatility_breakout(df) else 0.0
+            # Volatility breakout: 1 if breaking out
+            df['vol_breakout'] = 1.0 if MarketAnalyzer.detect_volatility_breakout(df) else 0.0
+        else:
+            # During TRAINING: Use optimized rolling application to avoid leakage
+            for col in ['structure', 'divergence', 'vsa', 'liq_sweep', 'ob_near', 'fvg', 'wyckoff', 'vol_anomaly', 'vol_breakout']:
+                df[col] = 0.0
+
+            if not fast:
+                # Full mode: compute rolling MarketAnalyzer features (slow but accurate)
+                step = 1 if len(df) < 500 else 2
+                indices = range(50, len(df), step)
+                w_map = {"ACCUMULATION": 1.0, "MARKUP": 2.0, "DISTRIBUTION": -1.0, "MARKDOWN": -2.0}
+
+                for i in indices:
+                    sub_df = df.iloc[:i+1]
+                    last_p = sub_df['c'].iloc[-1]
+
+                    s_dir, _, _, _ = MarketAnalyzer.detect_structure(sub_df)
+                    df.at[df.index[i], 'structure'] = 1.0 if s_dir == "BULLISH" else (-1.0 if s_dir == "BEARISH" else 0.0)
+                    df.at[df.index[i], 'divergence'] = float(MarketAnalyzer.detect_rsi_divergence(sub_df))
+                    df.at[df.index[i], 'vsa'] = float(MarketAnalyzer.detect_vsa_signals(sub_df))
+                    df.at[df.index[i], 'liq_sweep'] = float(MarketAnalyzer.detect_liquidity_sweep(sub_df))
+
+                    ob_bull = MarketAnalyzer.find_nearest_order_block(sub_df, last_p, 1)
+                    ob_bear = MarketAnalyzer.find_nearest_order_block(sub_df, last_p, -1)
+                    df.at[df.index[i], 'ob_near'] = 1.0 if ob_bull else (-1.0 if ob_bear else 0.0)
+
+                    fvg = MarketAnalyzer.get_nearest_fvg(sub_df)
+                    df.at[df.index[i], 'fvg'] = (1.0 if fvg and fvg["type"] == "BULLISH" else (-1.0 if fvg and fvg["type"] == "BEARISH" else 0.0))
+
+                    wyckoff = MarketAnalyzer.detect_wyckoff_phase(sub_df)
+                    df.at[df.index[i], 'wyckoff'] = w_map.get(wyckoff, 0.0)
+                    df.at[df.index[i], 'vol_anomaly'] = 1.0 if MarketAnalyzer.detect_volume_anomaly(sub_df) else 0.0
+                    df.at[df.index[i], 'vol_breakout'] = 1.0 if MarketAnalyzer.detect_volatility_breakout(sub_df) else 0.0
+
+                if step > 1:
+                    cols_to_fill = ['structure', 'divergence', 'vsa', 'liq_sweep', 'ob_near', 'fvg', 'wyckoff', 'vol_anomaly', 'vol_breakout']
+                    df[cols_to_fill] = df[cols_to_fill].replace(0.0, np.nan).ffill().fillna(0.0)
+            # fast=True: leave all at 0.0 (skip expensive loop)
 
         # ADX (trend strength)
         df['adx'] = MarketAnalyzer.get_adx(df, 14)
 
         # Orderbook imbalance from market_data (if available)
         from utils.state import market_data
-        df['ob_imbalance'] = market_data.imbalance.get(df.attrs.get('symbol', ''), 1.0)
+        symbol = df.attrs.get('symbol', '')
+        df['ob_imbalance'] = market_data.imbalance.get(symbol, 1.0) if symbol else 1.0
 
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.drop(columns=['typical_price', 'dir_vol', 'cvd'], inplace=True, errors='ignore')
@@ -350,25 +392,27 @@ class MLPredictor:
                 df['oi'] = 0.0
         return df
 
-    async def train_model(self, client, symbol, end_time=None):
+    async def train_model(self, client, symbol, end_time=None, fast=False):
+        # fast=True: use fewer candles for startup speed
+        total = 500 if fast else 1500
         # Try 1m first (more data points, better for scalping)
-        df = await self.fetch_extended_data(client, symbol, interval="1m", total=1500)
+        df = await self.fetch_extended_data(client, symbol, interval="1m", total=total)
         lookahead = 15
         if df is not None and len(df) >= 200:
             df = await self._inject_funding_oi(client, symbol, df)
-            ok = await asyncio.to_thread(self._train_sync, df, symbol, lookahead)
+            ok = await asyncio.to_thread(self._train_sync, df, symbol, lookahead, fast=fast)
             if ok:
                 return True
-        # Fallback to 15m (smoother data, better patterns for major coins)
-        df = await self.fetch_extended_data(client, symbol, interval="15m", total=1500)
+        # Fallback to 15m
+        df = await self.fetch_extended_data(client, symbol, interval="15m", total=total)
         lookahead = 10
         if df is None or len(df) < 100:
             return False
         df = await self._inject_funding_oi(client, symbol, df)
-        return await asyncio.to_thread(self._train_sync, df, symbol, lookahead)
+        return await asyncio.to_thread(self._train_sync, df, symbol, lookahead, fast=fast)
 
-    def _train_sync(self, df, symbol, lookahead):
-        df_sync = self.feature_engineering(df.copy())
+    def _train_sync(self, df, symbol, lookahead, fast=False):
+        df_sync = self.feature_engineering(df.copy(), fast=fast)
         df_sync = self.apply_triple_barrier(df_sync, pt_mult=1.5, sl_mult=1.2, lookahead=lookahead)
         if len(df_sync) < 60:
             return False
@@ -376,6 +420,7 @@ class MLPredictor:
         features = self._get_feature_list(df_sync.columns)
         X, y = df_sync[features], df_sync['target']
 
+        n_est = 40 if fast else 80
         tscv = TimeSeriesSplit(n_splits=2)
         scores_lgb, scores_xgb, scores_mlp, scores_ens = [], [], [], []
         last_lgb, last_xgb, last_mlp, last_scaler = None, None, None, None
@@ -386,7 +431,7 @@ class MLPredictor:
 
             # --- LightGBM ---
             m_lgb = lgb.LGBMClassifier(
-                n_estimators=80, learning_rate=0.08, max_depth=5,
+                n_estimators=n_est, learning_rate=0.08, max_depth=5,
                 num_leaves=20, subsample=0.8, colsample_bytree=0.8,
                 class_weight='balanced', n_jobs=2, verbose=-1, random_state=42
             )
@@ -396,7 +441,7 @@ class MLPredictor:
 
             # --- XGBoost ---
             m_xgb = xgb.XGBClassifier(
-                n_estimators=80, learning_rate=0.08, max_depth=5,
+                n_estimators=n_est, learning_rate=0.08, max_depth=5,
                 subsample=0.8, colsample_bytree=0.8,
                 scale_pos_weight=(y_tr == 0).sum() / max((y_tr == 1).sum(), 1),
                 use_label_encoder=False, eval_metric='logloss',
@@ -412,7 +457,7 @@ class MLPredictor:
             X_te_s = scaler.transform(X_te)
 
             m_mlp = MLPClassifier(
-                hidden_layer_sizes=(32, 16), max_iter=150,
+                hidden_layer_sizes=(32, 16), max_iter=80 if fast else 150,
                 learning_rate='adaptive', early_stopping=True,
                 validation_fraction=0.15, random_state=42
             )
@@ -447,7 +492,7 @@ class MLPredictor:
     async def batch_pretrain(self, client, symbols):
         async def _train_one(sym):
             async with self.retrain_sem:
-                await self.train_model(client, sym)
+                await self.train_model(client, sym, fast=True)
         await asyncio.gather(*[_train_one(s) for s in symbols], return_exceptions=True)
         self.startup_done = True
 

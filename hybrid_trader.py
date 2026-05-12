@@ -152,7 +152,7 @@ async def trading_loop(client):
 
             # 3. Smart Coin Selection (Multi-Factor Screener)
             filtered = [t for t in market_data.tickers if t["q"] > MIN_VOLUME_FILTER]
-            top_symbols = screen_coins(filtered, top_n=30)
+            top_symbols = screen_coins(filtered, top_n=40)
             
             # Ensure active positions + limit orders always stay subscribed + analyzed
             for p in bot_state.get("active_positions", []):
@@ -164,7 +164,7 @@ async def trading_loop(client):
             
             # TURBO UI Placeholder
             placeholder_results = []
-            for sym in top_symbols[:20]:
+            for sym in top_symbols[:25]:
                 k = market_data.klines.get(sym, {})
                 status = "SYNC (1m)" if "1m" not in k else "READY"
                 price_val = market_data.prices.get(sym, 0)
@@ -212,123 +212,96 @@ async def trading_loop(client):
             if loop_count % 100 == 0:
                 await asyncio.to_thread(load_state_from_db)
 
-            # 5. Analysis Phase (Concurrent and Smart - Parallel)
-            top_20 = top_symbols[:20]  # Analisa paralel 20 koin
-            
-            # Scan top 20 plus any active positions and limit orders in parallel
-            scan_targets = list(set(top_20 + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
-                
-            market_data.current_scan_list = scan_targets
-            
-            # Depth predictor observation (label walls for training)
-            for s in scan_targets[:10]:
-                depth_predictor.observe_and_label(s)
-            
-            # Aggressive ML training: train any scan target that has no model yet
-            if loop_count % 10 == 1:
-                untrained = [s for s in scan_targets if s not in ml_predictor.models and s not in ml_predictor._retraining]
-                if untrained:
-                    asyncio.create_task(ml_predictor.batch_pretrain(client, untrained[:6]))
-            
-            # Fetch institutional data (OI & Funding) periodically (Setiap ~30 detik untuk menghemat rate limit)
-            if loop_count % 20 == 0:
-                await get_market_depth_data(client, scan_targets)
-            
-            # Concurrently analyze ALL targeted symbols in parallel (no batching delay)
-            tasks = [analyze_hybrid_async(client, s) for s in scan_targets]
-            batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-            all_results = list(zip(scan_targets, batch_results))
-            
-            # Merge results into state
-            current_results_map = {r["sym"]: r for r in bot_state.get("last_scan_results", []) if r.get("regime") != "SCANNING"}
-            
-            for sym, res in all_results:
-                if isinstance(res, Exception):
-                    log_error(f"Concurrent Analysis Error: {str(res)}")
-                elif res:
-                    current_results_map[res["sym"]] = res
-            
-            # Rebuild list for UI
-            analysis_results = []
-            for t in top_20:
-                sym_short = t.replace("USDT", "")
-                if sym_short in current_results_map:
-                    analysis_results.append(current_results_map[sym_short])
-                else:
-                    # Add placeholder for unscanned top symbols
-                    price_val = market_data.prices.get(t, 0)
-                    k = market_data.klines.get(t, {})
-                    status = "SYNC" if "1m" not in k else "WAIT"
-                    analysis_results.append({
-                        "sym": sym_short, "price": f"{price_val:,.4f}",
-                        "sig": status, "score": 0, "dir": 0,
-                        "struct": "WAIT", "regime": "SCANNING"
-                    })
-                    
-            for s in scan_targets:
-                sym_short = s.replace("USDT", "")
-                if sym_short not in [r["sym"] for r in analysis_results] and sym_short in current_results_map:
-                    analysis_results.append(current_results_map[sym_short])
-            
-            if analysis_results:
-                bot_state["last_scan_results"] = sorted(analysis_results, key=lambda x: x.get('score', -1), reverse=True)
-            
-            # 6. Execution Phase
-            if not bot_state.get("is_passive", False):
-                for s in analysis_results:
-                    if "WAIT" in s["sig"] or s.get("ai") is None: continue
-                    sym_full = s["sym"] + "USDT"
-                    
-                    # PREVENT DUPLICATES: Skip if already in active position OR already has a pending limit order
-                    if any(p['symbol'] == sym_full for p in active_pos): continue
-                    
-                    # --- BLACKLIST & COOLDOWN FILTER (C2 & C3) ---
-                    if bot_state.get("blacklist", {}).get(sym_full, 0) > time.time(): continue
-                    
-                    sym_perf = bot_state.get("sym_perf", {}).get(sym_full, {})
-                    if sym_perf.get("c", 0) >= MAX_CONSEC_LOSSES:
-                        last_loss = sym_perf.get("last_loss_time", 0)
-                        if time.time() - last_loss < CONSEC_LOSS_COOLDOWN_SEC:
-                            bot_state.setdefault("blacklist", {})[sym_full] = time.time() + CONSEC_LOSS_COOLDOWN_SEC
-                            bot_state["sym_perf"][sym_full]["c"] = 0 # Reset biar tidak infinite loop
-                            asyncio.create_task(alert_cooldown(sym_full, MAX_CONSEC_LOSSES))
-                            continue
-                            
-                    is_replacement = sym_full in bot_state.get("limit_orders", {})
-                    # If already has a limit order and it's NOT a replacement (same direction), skip it
-                    if is_replacement:
-                        old_lo = bot_state["limit_orders"][sym_full]
-                        sig_side = "LONG" if s["dir"] == 1 else "SHORT"
-                        old_side = "LONG" if old_lo["side"] == "BUY" else "SHORT"
-                        
-                        # If same side, only continue if BOTH are limit orders. 
-                        # If the new signal is MARKET, we want to replace the old limit order.
-                        new_is_market = s.get("ai", {}).get("is_market", False)
-                        if sig_side == old_side and not new_is_market: continue
-                    
-                    sig_side = "LONG" if s["dir"] == 1 else "SHORT"
-                    if is_correlated_exposure(sym_full, sig_side): continue
-                    
-                    can_open = False
-                    if not USE_BTC_FILTER or bot_state["btc_dir"] == 0: can_open = True
-                    elif sig_side == "LONG" and bot_state["btc_dir"] == 1: can_open = True
-                    elif sig_side == "SHORT" and bot_state["btc_dir"] == -1: can_open = True
-                    
-                    if can_open:
-                        current_slots = len(active_pos) + len(bot_state.get("limit_orders", {}))
-                        
-                        if current_slots < MAX_POSITIONS or is_replacement:
+            # 5. Analysis Phase — run as background task, throttled to every 2 loops
+            # This prevents analysis from blocking the UI event loop
+            if loop_count % 2 == 0:
+                top_20 = top_symbols[:25]
+                scan_targets = list(set(top_20 + [p['symbol'] for p in active_pos] + list(bot_state.get("limit_orders", {}).keys())))
+                market_data.current_scan_list = scan_targets
+
+                for s in scan_targets[:15]:
+                    depth_predictor.observe_and_label(s)
+
+                if loop_count % 10 == 0:
+                    untrained = [s for s in scan_targets if s not in ml_predictor.models and s not in ml_predictor._retraining]
+                    if untrained:
+                        asyncio.create_task(ml_predictor.batch_pretrain(client, untrained[:6]))
+
+                if loop_count % 20 == 0:
+                    await get_market_depth_data(client, scan_targets)
+
+                async def _run_analysis():
+                    tasks = [analyze_hybrid_async(client, s) for s in scan_targets]
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+                    current_results_map = {r["sym"]: r for r in bot_state.get("last_scan_results", []) if r.get("regime") != "SCANNING"}
+                    for sym, res in zip(scan_targets, batch_results):
+                        if isinstance(res, Exception):
+                            log_error(f"Concurrent Analysis Error: {str(res)}")
+                        elif res is not None:
+                            current_results_map[res["sym"]] = res
+                    analysis_results = []
+                    for t in top_20:
+                        sym_short = t.replace("USDT", "")
+                        if sym_short in current_results_map:
+                            analysis_results.append(current_results_map[sym_short])
+                        else:
+                            price_val = market_data.prices.get(t, 0)
+                            k = market_data.klines.get(t, {})
+                            analysis_results.append({
+                                "sym": sym_short, "price": f"{price_val:,.4f}",
+                                "sig": "SYNC" if "1m" not in k else "WAIT", "score": 0, "dir": 0,
+                                "struct": "WAIT", "regime": "SCANNING", "ai": None
+                            })
+                    for s in scan_targets:
+                        sym_short = s.replace("USDT", "")
+                        if sym_short not in [r["sym"] for r in analysis_results] and sym_short in current_results_map:
+                            analysis_results.append(current_results_map[sym_short])
+                    if analysis_results:
+                        bot_state["last_scan_results"] = sorted(analysis_results, key=lambda x: x.get('score', -1), reverse=True)
+                    # Execution Phase (inside analysis task to use fresh results)
+                    if not bot_state.get("is_passive", False):
+                        for s in analysis_results:
+                            if "WAIT" in s["sig"] or s.get("ai") is None: continue
+                            sym_full = s["sym"] + "USDT"
+                            if any(p['symbol'] == sym_full for p in active_pos): continue
+                            if sym_full in bot_state.get("trades", {}): continue
+                            if sym_full in bot_state.get("limit_orders", {}) and s["dir"] == (1 if bot_state["limit_orders"][sym_full]["side"] == "BUY" else -1): continue
+                            if bot_state.get("blacklist", {}).get(sym_full, 0) > time.time(): continue
+                            sym_perf = bot_state.get("sym_perf", {}).get(sym_full, {})
+                            if sym_perf.get("c", 0) >= MAX_CONSEC_LOSSES:
+                                last_loss = sym_perf.get("last_loss_time", 0)
+                                if time.time() - last_loss < CONSEC_LOSS_COOLDOWN_SEC:
+                                    bot_state.setdefault("blacklist", {})[sym_full] = time.time() + CONSEC_LOSS_COOLDOWN_SEC
+                                    bot_state["sym_perf"][sym_full]["c"] = 0
+                                    asyncio.create_task(alert_cooldown(sym_full, MAX_CONSEC_LOSSES))
+                                    continue
+                            is_replacement = sym_full in bot_state.get("limit_orders", {})
                             if is_replacement:
                                 old_lo = bot_state["limit_orders"][sym_full]
-                                try:
-                                    await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": sym_full, "orderId": old_lo["orderId"]})
-                                    # Also delete associated SL/TP algo orders
-                                    await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym_full})
-                                    del bot_state["limit_orders"][sym_full]
-                                except Exception as e:
-                                    log_error(f"Order replacement cancel failed for {sym_full}: {e}", include_traceback=False)
-                            
-                            await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
+                                sig_side = "LONG" if s["dir"] == 1 else "SHORT"
+                                old_side = "LONG" if old_lo["side"] == "BUY" else "SHORT"
+                                new_is_market = s.get("ai", {}).get("is_market", False)
+                                if sig_side == old_side and not new_is_market: continue
+                            sig_side = "LONG" if s["dir"] == 1 else "SHORT"
+                            if is_correlated_exposure(sym_full, sig_side): continue
+                            can_open = False
+                            if not USE_BTC_FILTER or bot_state["btc_dir"] == 0: can_open = True
+                            elif sig_side == "LONG" and bot_state["btc_dir"] == 1: can_open = True
+                            elif sig_side == "SHORT" and bot_state["btc_dir"] == -1: can_open = True
+                            if can_open:
+                                current_slots = len(active_pos) + len(bot_state.get("limit_orders", {}))
+                                if current_slots < MAX_POSITIONS or is_replacement:
+                                    if is_replacement:
+                                        old_lo = bot_state["limit_orders"][sym_full]
+                                        try:
+                                            await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": sym_full, "orderId": old_lo["orderId"]})
+                                            await binance_request(client, 'DELETE', '/fapi/v1/allOpenOrders', {"symbol": sym_full})
+                                            del bot_state["limit_orders"][sym_full]
+                                        except Exception as e:
+                                            log_error(f"Order replacement cancel failed for {sym_full}: {e}", include_traceback=False)
+                                    await open_position_async(client, sym_full, "BUY" if sig_side == "LONG" else "SELL", s["sig"], s["ai"])
+
+                asyncio.create_task(_run_analysis())
 
             bot_state["heartbeat"] += 1
             
@@ -433,7 +406,7 @@ async def main():
         
         ui_queue = asyncio.Queue()
 
-        with Live(None, refresh_per_second=4, screen=True) as live:
+        with Live(None, refresh_per_second=2, screen=True) as live:
             async def handle_keys():
                 def get_char():
                     if not os.isatty(sys.stdin.fileno()):
@@ -513,9 +486,9 @@ async def main():
                                 live.start()
                         ui_queue.task_done()
 
-                    dashboard = await generate_dashboard_async(client)
+                    dashboard = await generate_dashboard_async()
                     live.update(dashboard)
-                    await asyncio.sleep(0.25)
+                    await asyncio.sleep(0.5)
                 except Exception as e:
                     bot_state["ui_active"] = False
                     try: live.start()

@@ -41,7 +41,7 @@ class ScalpingBrain:
         self._flow_history = {}  # {symbol: deque of ofi values}
         self._intensity_history = {}  # {symbol: deque of trade counts per second}
 
-    def compute(self, symbol: str, direction: int, regime: str, d1m=None, d15m=None, d1h=None) -> dict:
+    async def compute(self, symbol: str, direction: int, regime: str, d1m=None, d15m=None, d1h=None, client=None) -> dict:
         """Compute meta-signal. Returns dict with confidence and entry quality."""
         cache_key = (symbol, direction)
         cached = self._cache.get(cache_key)
@@ -50,7 +50,7 @@ class ScalpingBrain:
 
         # Gather all sub-signals
         sh = superhuman.compute(symbol, d1m, d15m, d1h)
-        micro = micro_engine.compute(symbol, window_sec=60)
+        micro = await micro_engine.compute(symbol, window_sec=60, client=client)
 
         # Compute new proprietary signals
         flow_accel = self._order_flow_acceleration(symbol, micro)

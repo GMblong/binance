@@ -5,9 +5,9 @@ MIN_NOTIONAL_USD = 5.5          # Binance minimum order value
 MIN_VOLUME_FILTER = 5_000_000   # Minimum 24h quote volume for scanning
 MIN_VOLUME_SCREENER = 10_000_000  # Minimum volume for coin screener
 TAKER_FEE_PCT = 0.08  # Round-trip taker fee (0.04% open + 0.04% close)
-CONSEC_LOSS_COOLDOWN_SEC = 3600   # 60 min cooldown after 3 consecutive losses
+CONSEC_LOSS_COOLDOWN_SEC = 1200   # 20 min cooldown after 3 consecutive losses (scalping: faster recovery)
 MAX_CONSEC_LOSSES = 3             # Trigger cooldown after N losses
-ML_RETRAIN_INTERVAL_SEC = 7200    # 2h between ML model retrains (scalping needs fresh models)
+ML_RETRAIN_INTERVAL_SEC = 3600    # 1h between ML model retrains (more frequent = more adaptive)
 API_BAN_SLEEP_SEC = 300           # Sleep duration on 418 hard ban
 KLINE_MAX_CANDLES = 300           # Max candles to keep in memory
 DB_SAVE_INTERVAL_SEC = 30         # Batched DB write interval

@@ -17,6 +17,7 @@ async def binance_request(client: httpx.AsyncClient, method: str, endpoint: str,
     
     params = params or {}
     params['timestamp'] = int(time.time() * 1000)
+    params['recvWindow'] = 10000  # 10s window to tolerate clock drift
     query_string = urllib.parse.urlencode(params)
     signature = get_signature(query_string, API_SECRET)
     full_params = {**params, "signature": signature}
@@ -59,6 +60,18 @@ async def binance_request(client: httpx.AsyncClient, method: str, endpoint: str,
                         # -4120: Order type not supported (handled by fallback)
                         if err_code in [-4130, -4028, -4046, -4509, -4120]:
                             return res # Silent return
+                        if err_code == -1021:
+                            # Timestamp out of sync — resync with server time and retry
+                            try:
+                                ts_res = await client.get(f"{API_URL}/fapi/v1/time", timeout=5)
+                                if ts_res.status_code == 200:
+                                    server_time = ts_res.json()["serverTime"]
+                                    params['timestamp'] = server_time
+                                    query_string = urllib.parse.urlencode(params)
+                                    params['signature'] = get_signature(query_string, API_SECRET)
+                                    continue  # retry with corrected timestamp
+                            except Exception:
+                                pass
                         
                         bot_state["api_err_count"] = bot_state.get("api_err_count", 0) + 1
                         log_error(f"API 400 Error for {endpoint}: {res.text}", include_traceback=False)
@@ -107,6 +120,16 @@ async def get_symbol_precision(client: httpx.AsyncClient, symbol: str) -> dict:
     if "BTC" in symbol or "ETH" in symbol:
         return {"tick": 0.01, "step": 0.001, "p_prec": 2, "q_prec": 3}
     return {"tick": 0.0001, "step": 0.1, "p_prec": 4, "q_prec": 1}
+
+async def fetch_recent_trades(client: httpx.AsyncClient, symbol: str, limit: int = 500) -> list:
+    """Fetch recent aggTrades from REST API to warm up tick buffer."""
+    try:
+        res = await client.get(f"{API_URL}/fapi/v1/aggTrades", params={"symbol": symbol, "limit": limit})
+        if res.status_code == 200:
+            return res.json()
+    except Exception as e:
+        log_error(f"REST Trade Fetch Error ({symbol}): {str(e)}")
+    return []
 
 async def get_listen_key(client: httpx.AsyncClient) -> Optional[str]:
     try:

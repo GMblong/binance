@@ -44,8 +44,8 @@ class WebSocketManager:
         # @aggTrade is expensive (hundreds of msg/sec for BTC) so we limit it
         # to the top-N coins where live CVD actually matters for entries.
         # @depth@500ms for top-N coins for real-time orderflow microstructure.
-        AGG_TOP_N = 10
-        DEPTH_TOP_N = 10
+        AGG_TOP_N = 30
+        DEPTH_TOP_N = 30
         agg_symbols = set(symbols[:AGG_TOP_N])
         depth_symbols = set(symbols[:DEPTH_TOP_N])
         desired = set()
@@ -53,7 +53,8 @@ class WebSocketManager:
         for s in symbols:
             s_low = s.lower()
             desired.add(f"{s_low}@ticker")
-            for interval in ["1m", "5m", "15m", "1h"]:
+            # Only 1m and 15m via WS (5m and 1h are updated via REST to save streams)
+            for interval in ["1m", "15m"]:
                 desired.add(f"{s_low}@kline_{interval}")
             if s in agg_symbols:
                 desired.add(f"{s_low}@aggTrade")
@@ -73,6 +74,7 @@ class WebSocketManager:
                         "params": batch,
                         "id": int(time.time() * 1000) % 100000
                     }))
+                    await asyncio.sleep(0.1)  # Rate limit safety
                 self.active_streams.update(to_subscribe)
             except Exception:
                 pass  # WS subscription failures are retried on next cycle

@@ -55,7 +55,7 @@ class SuperhumanDetector:
             "micro_momentum": 0,      # -1/0/+1: Tick-level trend shift
         }
 
-        trades = market_data.get_trades(symbol, window_sec=120, max_items=1000)
+        trades = market_data.get_trades(symbol, window_sec=120, max_items=3000)
         n = len(trades)
 
         # --- 1. Tick Imbalance Bars ---

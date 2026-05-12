@@ -20,8 +20,9 @@ api_sem = asyncio.Semaphore(15)  # Higher concurrency for parallel analysis
 busy_symbols = set()
 
 # Analysis result cache - avoid re-analyzing if data hasn't changed
-_analysis_cache = {}  # {symbol: (last_kline_ot, result)}
+_analysis_cache = {}  # {symbol: (last_kline_ot, result, ts)}
 _indicator_cache = {}  # {(symbol, interval): (last_ot, indicators_dict)}
+_IND_TTL = 4.0  # seconds — reuse indicators if candle hasn't changed
 
 
 def is_near_funding_settlement(buffer_minutes=10):
@@ -98,40 +99,52 @@ async def analyze_hybrid_async(client, symbol):
             if cached and cached[0] == last_ot and (now - cached[2]) < 3.0:
                 return cached[1]
         
-        last_p = market_data.last_prime.get(symbol, 0)
-        # Force sync if data is missing
-        if "1m" not in market_data.klines.get(symbol, {}) or (now - last_p) > 60: 
-            busy_symbols.add(symbol)
-            try:
-                async with api_sem:
-                    headers = {'User-Agent': 'Mozilla/5.0'}
-                    if API_KEY: headers['X-MBX-APIKEY'] = API_KEY
-                    
-                    res1, res15, res1h = await asyncio.gather(
-                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15),
-                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15),
-                        client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15),
-                    )
-                    
-                    
-                    if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
-                        data1, data15, data1h = res1.json(), res15.json(), res1h.json()
+        # Optimasi Sinkronisasi: Gunakan data WS jika tersedia dan segar
+        k = market_data.klines.get(symbol, {})
+        has_data = "1m" in k and "15m" in k and "1h" in k
+        
+        # Cek kesegaran data 1m (prioritas WS)
+        is_fresh = False
+        if "1m" in k and not k["1m"].empty:
+            last_ts = k["1m"].iloc[-1]["ot"] / 1000.0
+            if (now - last_ts) < 120: # Data kurang dari 120 detik dianggap cukup segar untuk scalping
+                is_fresh = True
 
-                        def proc(data):
-                            df = pd.DataFrame(data).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
-                            df.columns = ["ot", "o", "h", "l", "c", "v", "tbv"]
-                            for col in ["o", "h", "l", "c", "v", "tbv"]: df[col] = df[col].astype(float)
-                            return df
-                        market_data.klines[symbol]["1m"] = proc(data1)
-                        market_data.klines[symbol]["15m"] = proc(data15)
-                        market_data.klines[symbol]["1h"] = proc(data1h)
-                        market_data.last_prime[symbol] = now
+        # Force sync via REST hanya jika data hilang atau basi (> 2 menit)
+        if not has_data or not is_fresh:
+            last_p = market_data.last_prime.get(symbol, 0)
+            # Throttle REST sync agar tidak spam (min 30s antar fetch per koin)
+            if (now - last_p) > 30:
+                busy_symbols.add(symbol)
+                try:
+                    async with api_sem:
+                        headers = {'User-Agent': 'Mozilla/5.0'}
+                        if API_KEY: headers['X-MBX-APIKEY'] = API_KEY
+                        
+                        res1, res15, res1h = await asyncio.gather(
+                            client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1m", "limit": 200}, headers=headers, timeout=15),
+                            client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "15m", "limit": 100}, headers=headers, timeout=15),
+                            client.get(f"{API_URL}/fapi/v1/klines", params={"symbol": symbol, "interval": "1h", "limit": 50}, headers=headers, timeout=15),
+                        )
+                        
+                        if res1.status_code == 200 and res15.status_code == 200 and res1h.status_code == 200:
+                            data1, data15, data1h = res1.json(), res15.json(), res1h.json()
 
-                    else:
-                        # SET LAST_PRIME TO AVOID SPAMMING ON FAILURE (Backoff 30 seconds)
-                        market_data.last_prime[symbol] = now - 30 
-            finally:
-                busy_symbols.discard(symbol)
+                            def proc(data):
+                                df = pd.DataFrame(data).iloc[:, [0, 1, 2, 3, 4, 5, 9]]
+                                df.columns = ["ot", "o", "h", "l", "c", "v", "tbv"]
+                                for col in ["o", "h", "l", "c", "v", "tbv"]: df[col] = df[col].astype(float)
+                                return df
+                            market_data.klines[symbol]["1m"] = proc(data1)
+                            market_data.klines[symbol]["15m"] = proc(data15)
+                            market_data.klines[symbol]["1h"] = proc(data1h)
+                            market_data.last_prime[symbol] = now
+
+                        else:
+                            # SET LAST_PRIME TO AVOID SPAMMING ON FAILURE (Backoff 30 seconds)
+                            market_data.last_prime[symbol] = now - 30 
+                finally:
+                    busy_symbols.discard(symbol)
 
         k = market_data.klines.get(symbol, {})
         # Re-check cache *after* sync attempt
@@ -144,26 +157,62 @@ async def analyze_hybrid_async(client, symbol):
         try:
             price = d1m["c"].iloc[-1]
             
-            # --- SMART INDICATORS ---
-            ema9_15m = MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1]
-            ema21_15m = MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1]
-            ema9_1m = MarketAnalyzer.get_ema(d1m["c"], 9).iloc[-1]
-            atr = MarketAnalyzer.get_atr(d1m, 14).iloc[-1]
-            
-            # ADX filter: only trust EMA cross when trend is strong
-            adx_val = MarketAnalyzer.get_adx(d15m, 14)
-            rsi_15m = MarketAnalyzer.get_rsi(d15m["c"], 14).iloc[-1]
+            # --- SMART INDICATORS (compute once, reuse everywhere) ---
+            # Check indicator cache first
+            _ind_key_1m = (symbol, "1m")
+            _ind_key_15m = (symbol, "15m")
+            _last_ot_1m = float(d1m.iloc[-1]['ot'])
+            _last_ot_15m = float(d15m.iloc[-1]['ot'])
+            _cached_1m = _indicator_cache.get(_ind_key_1m)
+            _cached_15m = _indicator_cache.get(_ind_key_15m)
+
+            if _cached_1m and _cached_1m[0] == _last_ot_1m and (now - _cached_1m[2]) < _IND_TTL:
+                ind1m = _cached_1m[1]
+            else:
+                _ema9_1m_s  = MarketAnalyzer.get_ema(d1m["c"], 9)
+                _ema21_1m_s = MarketAnalyzer.get_ema(d1m["c"], 21)
+                _rsi_1m_s   = MarketAnalyzer.get_rsi(d1m["c"], 14)
+                ind1m = {
+                    "ema9":  _ema9_1m_s.iloc[-1],
+                    "ema21": _ema21_1m_s.iloc[-1],
+                    "rsi":   _rsi_1m_s.iloc[-1],
+                    "atr":   MarketAnalyzer.get_atr(d1m, 14).iloc[-1],
+                }
+                _indicator_cache[_ind_key_1m] = (_last_ot_1m, ind1m, now)
+
+            if _cached_15m and _cached_15m[0] == _last_ot_15m and (now - _cached_15m[2]) < _IND_TTL:
+                ind15m = _cached_15m[1]
+            else:
+                _rsi_15m_s = MarketAnalyzer.get_rsi(d15m["c"], 14)
+                ind15m = {
+                    "ema9":  MarketAnalyzer.get_ema(d15m["c"], 9).iloc[-1],
+                    "ema21": MarketAnalyzer.get_ema(d15m["c"], 21).iloc[-1],
+                    "rsi":   _rsi_15m_s.iloc[-1],
+                    "rsi_prev": _rsi_15m_s.iloc[-3] if len(_rsi_15m_s) >= 3 else _rsi_15m_s.iloc[-1],
+                    "adx":   MarketAnalyzer.get_adx(d15m, 14),
+                    "atr":   MarketAnalyzer.get_atr(d15m, 14).iloc[-1] if len(d15m) >= 14 else ind1m["atr"],
+                }
+                _indicator_cache[_ind_key_15m] = (_last_ot_15m, ind15m, now)
+
+            # Unpack — single source of truth, no recomputation below
+            ema9_1m   = ind1m["ema9"]
+            ema21_1m  = ind1m["ema21"]
+            rsi_1m    = ind1m["rsi"]
+            atr       = ind1m["atr"]
+            ema9_15m  = ind15m["ema9"]
+            ema21_15m = ind15m["ema21"]
+            rsi_15m   = ind15m["rsi"]
+            adx_val   = ind15m["adx"]
+            atr_15m   = ind15m["atr"]
             is_reversal_trade = False
             if adx_val > 20:
                 ema_dir = 1 if ema9_15m > ema21_15m else -1
                 
                 # EXHAUSTION REVERSAL: trend sudah di ujung, ambil posisi reversal
-                # RSI extreme + EMA masih lagging = peluang scalp reversal
-                _rsi_1m_dir = MarketAnalyzer.get_rsi(d1m["c"], 14).iloc[-1]
-                if ema_dir == -1 and (rsi_15m < 35 or _rsi_1m_dir < 30):
+                if ema_dir == -1 and (rsi_15m < 35 or rsi_1m < 30):
                     direction = 1   # Trend bearish exhausted → LONG (bounce)
                     is_reversal_trade = True
-                elif ema_dir == 1 and (rsi_15m > 65 or _rsi_1m_dir > 70):
+                elif ema_dir == 1 and (rsi_15m > 65 or rsi_1m > 70):
                     direction = -1  # Trend bullish exhausted → SHORT (drop)
                     is_reversal_trade = True
                 else:
@@ -186,15 +235,28 @@ async def analyze_hybrid_async(client, symbol):
         ema20_1h = MarketAnalyzer.get_ema(d1h["c"], 20).iloc[-1] if len(d1h) >= 20 else price
         ema50_1h = MarketAnalyzer.get_ema(d1h["c"], 50).iloc[-1] if len(d1h) >= 50 else ema20_1h
         htf_direction = 1 if d1h["c"].iloc[-1] > ema50_1h else -1
-        # Stricter MTF: check 1m RSI alignment too
-        rsi_1m = MarketAnalyzer.get_rsi(d1m["c"], 14).iloc[-1]
+        # Stricter MTF: check 1m RSI alignment too (reuse cached rsi_1m)
         m1_aligned = (direction == 1 and rsi_1m > 45) or (direction == -1 and rsi_1m < 55)
         mtf_aligned = (direction == htf_direction) and m1_aligned
         
-        # --- INSTITUTIONAL DATA GATHERING ---
-        imbalance = await get_orderbook_imbalance(client, symbol)
-        funding = market_data.funding.get(symbol, 0.0)
+        # --- INSTITUTIONAL DATA GATHERING (parallel async) ---
+        _gather_results = await asyncio.gather(
+            get_orderbook_imbalance(client, symbol),
+            micro_engine.compute(symbol, window_sec=60, client=client),
+            scalping_brain.compute(symbol, direction, MarketAnalyzer.detect_regime(d15m), d1m, d15m, d1h, client=client),
+            return_exceptions=True,
+        )
+        imbalance = _gather_results[0] if not isinstance(_gather_results[0], Exception) else 1.0
+        micro = _gather_results[1] if not isinstance(_gather_results[1], Exception) and _gather_results[1] else {
+            "vpin": 0.5, "ofi": 0.0, "hurst": 0.5, "entropy": 0.5, "microprice_skew": 0.0,
+            "absorption": 0.0, "whale_prints": 0, "quote_stuffing": 0.0, "hawkes_intensity": 0.0,
+            "vol_compression": 0.0, "skewness": 0.0, "kurtosis": 3.0,
+        }
+        brain = _gather_results[2] if not isinstance(_gather_results[2], Exception) and _gather_results[2] else {
+            "score_boost": 0, "n_signals": 0, "entry_quality": 0.0, "signals_fired": [],
+        }
         regime = MarketAnalyzer.detect_regime(d15m)
+        funding = market_data.funding.get(symbol, 0.0)
         session = get_current_session()
         lead_lag = detect_lead_lag(symbol)
         
@@ -212,15 +274,15 @@ async def analyze_hybrid_async(client, symbol):
         
         # Penalize if 15m and 1h disagree (counter-trend = high risk)
         if not mtf_aligned:
-            score = int(score * 0.6)  # 40% penalty for fighting HTF
+            score = int(score * 0.75)  # 25% penalty for fighting HTF
         
         # --- FUNDING RATE TIMING FILTER ---
         if is_near_funding_settlement(10):
-            score = int(score * 0.5)  # Heavy penalty near funding settlement
+            score = int(score * 0.75)  # Penalty near funding settlement
         
         # --- SPREAD FILTER ---
         if is_spread_too_wide(symbol, max_spread_bps=15):
-            score = int(score * 0.4)  # Very wide spread = bad liquidity
+            score = int(score * 0.6)  # Very wide spread = bad liquidity
         
         # --- OI DELTA MOMENTUM ---
         oi_signal = get_oi_delta_signal(symbol)
@@ -237,15 +299,15 @@ async def analyze_hybrid_async(client, symbol):
         ml_w = s_weights.get(f"{regime}:ml", 1.0) if s_weights else 1.0
 
         # Logika Baru (Scaled Confidence): 
-        # Hanya boost jika sangat yakin (>65% atau <35%), dan penalti berskala jika tidak setuju
+        # Hanya boost jika sangat yakin (>60% atau <40%), dan penalti berskala jika tidak setuju
         if direction == 1:
-            if ml_prob >= 0.65:
-                ml_score_boost = int((ml_prob - 0.6) * 50 * ml_w)
+            if ml_prob >= 0.60:
+                ml_score_boost = int((ml_prob - 0.55) * 50 * ml_w)
             elif ml_prob < 0.40:
                 ml_score_boost = int((ml_prob - 0.4) * 50 * ml_w) # Hasil negatif
         elif direction == -1:
-            if ml_prob <= 0.35:
-                ml_score_boost = int((0.4 - ml_prob) * 50 * ml_w)
+            if ml_prob <= 0.40:
+                ml_score_boost = int((0.45 - ml_prob) * 50 * ml_w)
             elif ml_prob > 0.60:
                 ml_score_boost = int((0.6 - ml_prob) * 50 * ml_w) # Hasil negatif
         
@@ -253,7 +315,7 @@ async def analyze_hybrid_async(client, symbol):
         
         # Penalti jika ML model belum tersedia — cap score agar tidak bisa entry
         if not ml_has_model:
-            score = min(score, 70)  # Max 70 tanpa ML = tidak bisa trigger entry (min 78)
+            score = min(score, 75)  # Max 75 tanpa ML
         
         # --- LIQUIDATION MAGNET (M2) ---
         liq = MarketAnalyzer.predict_liquidation_clusters(d15m)
@@ -334,34 +396,29 @@ async def analyze_hybrid_async(client, symbol):
             is_fake_move = MarketAnalyzer.detect_multi_candle_fake(d1m, direction)
         
         # --- IMMEDIATE EMA POSITION PENALTY ---
-        _ema9_chk = MarketAnalyzer.get_ema(d1m['c'], 9).iloc[-1]
-        _ema21_chk = MarketAnalyzer.get_ema(d1m['c'], 21).iloc[-1]
         if not is_reversal_trade:
-            if direction == 1 and price < _ema9_chk and price < _ema21_chk:
-                score = int(score * 0.7)
-            elif direction == -1 and price > _ema9_chk and price > _ema21_chk:
-                score = int(score * 0.7)
+            if direction == 1 and price < ema9_1m and price < ema21_1m:
+                score = int(score * 0.85)
+            elif direction == -1 and price > ema9_1m and price > ema21_1m:
+                score = int(score * 0.85)
         
         # --- TREND EXHAUSTION PENALTY ---
-        # Don't SHORT when RSI already very low (trend exhausted, bounce imminent)
-        # Don't LONG when RSI already very high (trend exhausted, drop imminent)
-        _rsi_1m_chk = MarketAnalyzer.get_rsi(d1m['c'], 14).iloc[-1]
-        if direction == -1 and _rsi_1m_chk < 30:
-            score = int(score * 0.4)  # 60% penalty: shorting at exhaustion
-        elif direction == 1 and _rsi_1m_chk > 70:
-            score = int(score * 0.4)  # 60% penalty: buying at exhaustion
+        if direction == -1 and rsi_1m < 30:
+            score = int(score * 0.7)
+        elif direction == 1 and rsi_1m > 70:
+            score = int(score * 0.7)
         elif direction == -1 and rsi_15m < 35:
-            score = int(score * 0.5)  # 50% penalty: shorting oversold on 15m
+            score = int(score * 0.75)
         elif direction == 1 and rsi_15m > 65:
-            score = int(score * 0.5)  # 50% penalty: buying overbought on 15m
+            score = int(score * 0.75)
         
         # --- WYCKOFF PHASE CONTEXT ---
         wyckoff = MarketAnalyzer.detect_wyckoff_phase(d15m)
         # Block entries against Wyckoff phase
         if direction == 1 and wyckoff == "DISTRIBUTION":
-            score = int(score * 0.5)  # Heavy penalty: buying into distribution
+            score = int(score * 0.7)  # Penalty: buying into distribution
         elif direction == -1 and wyckoff == "ACCUMULATION":
-            score = int(score * 0.5)  # Heavy penalty: shorting into accumulation
+            score = int(score * 0.7)  # Penalty: shorting into accumulation
         elif direction == 1 and wyckoff == "MARKUP":
             score = min(score + 10, 100)  # Bonus: buying in markup phase
             active_features.append(f"{regime}:wyckoff")
@@ -462,8 +519,6 @@ async def analyze_hybrid_async(client, symbol):
             active_features.append(f"{regime}:liq_cascade")
         
         # --- MICROSTRUCTURE ALPHA ENGINE (Superhuman Signals) ---
-        micro = micro_engine.compute(symbol, window_sec=60)
-        
         # VPIN: smart money detected (>0.6 = informed trading active)
         if micro["vpin"] > 0.6:
             # High VPIN + OFI alignment = strong institutional flow
@@ -600,7 +655,6 @@ async def analyze_hybrid_async(client, symbol):
             active_features.append(f"{regime}:price_disc")
 
         # --- SCALPING BRAIN META-INTELLIGENCE (Bayesian fusion of ALL invisible signals) ---
-        brain = scalping_brain.compute(symbol, direction, regime, d1m, d15m, d1h)
         score = min(max(score + brain["score_boost"], 0), 100)
         if brain["n_signals"] >= 5:
             active_features.append(f"{regime}:brain_confluence")
@@ -628,8 +682,7 @@ async def analyze_hybrid_async(client, symbol):
             elif vpoc and vpoc["poc"] < price and vpoc["poc"] > price * 0.97:
                 limit_p = vpoc["poc"]  # Volume POC as magnet support
             else:
-                # EMA21 pullback (deeper than EMA9 = better entry)
-                ema21_1m = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
+                # EMA21 pullback (deeper than EMA9 = better entry) — use cached
                 limit_p = ema21_1m if ema21_1m < price else ema9_1m
         else:
             # SHORT: place limit at resistance levels (above current price)
@@ -642,11 +695,9 @@ async def analyze_hybrid_async(client, symbol):
             elif vpoc and vpoc["poc"] > price and vpoc["poc"] < price * 1.03:
                 limit_p = vpoc["poc"]  # Volume POC as magnet resistance
             else:
-                ema21_1m = MarketAnalyzer.get_ema(d1m["c"], 21).iloc[-1]
                 limit_p = ema21_1m if ema21_1m > price else ema9_1m
 
         # --- SMART MARKET STRUCTURE SL & TP (H6) ---
-        atr_15m = MarketAnalyzer.get_atr(d15m, 14).iloc[-1] if len(d15m) >= 14 else atr
         atr_15m_pct = (atr_15m / price) * 100
         buffer_pct = max(base_atr_pct * 0.3, 0.12)
         
@@ -731,17 +782,17 @@ async def analyze_hybrid_async(client, symbol):
         is_breakout = raw_breakout and vol_confirmed and body_ratio > 0.5
         
         # Logika Baru: Adaptive Threshold berdasarkan Regime & Breakout
-        threshold = 75
+        threshold = 62
         if regime == "VOLATILE":
-            threshold = 70 if is_breakout else 85
+            threshold = 58 if is_breakout else 72
         elif regime == "RANGING":
-            threshold = 82
+            threshold = 68
         elif regime == "TRENDING":
-            threshold = 68 if is_breakout else 75
+            threshold = 60 if is_breakout else 65
         
         # Reversal scalps need lower threshold (by definition counter-trend)
         if is_reversal_trade:
-            threshold = max(threshold - 15, 55)
+            threshold = max(threshold - 20, 48)
             
         # --- ADAPTIVE EXECUTION ENGINE ---
         is_market_order = False
@@ -749,7 +800,7 @@ async def analyze_hybrid_async(client, symbol):
         # Check score momentum (rising score = momentum building, don't miss)
         prev_cached = _analysis_cache.get(symbol)
         prev_score = prev_cached[1]["score"] if prev_cached and prev_cached[1] else 0
-        score_rising = (score - prev_score) >= 10 and prev_score >= 70  # Jumped 10+ from already-high
+        score_rising = (score - prev_score) >= 8 and prev_score >= 55  # Jumped 8+ from already-decent
         
         # --- PULLBACK PROBABILITY ---
         _pb_score = 0
@@ -770,23 +821,23 @@ async def analyze_hybrid_async(client, symbol):
         
         # Market orders for high-conviction signals that pass ALL filters
         # 1. Classic breakout with extreme conviction
-        if regime == "TRENDING" and is_breakout and score >= 85 and not is_fake_move:
+        if regime == "TRENDING" and is_breakout and score >= 72 and not is_fake_move:
             is_market_order = True
             limit_p = price
         # 2. All filters pass + very high score = market order (don't miss the move)
-        elif score >= 88 and not is_fake_move and not is_overextended and vol_confirmed:
+        elif score >= 80 and not is_fake_move and not is_overextended and vol_confirmed:
             is_market_order = True
             limit_p = price
         # 3. MTF fully aligned + trending + strong score = market order
-        elif score >= 82 and mtf_aligned and regime == "TRENDING" and not is_fake_move and not is_overextended:
+        elif score >= 75 and mtf_aligned and regime == "TRENDING" and not is_fake_move and not is_overextended:
             is_market_order = True
             limit_p = price
         # 4. Score rising fast (momentum building) + trending = market order
-        elif score_rising and score >= 80 and regime == "TRENDING" and not is_fake_move:
+        elif score_rising and score >= 72 and regime == "TRENDING" and not is_fake_move:
             is_market_order = True
             limit_p = price
         # 5. No pullback expected + good score = market order (don't miss the move)
-        elif no_pullback and score >= 78 and not is_fake_move and not is_overextended:
+        elif no_pullback and score >= 68 and not is_fake_move and not is_overextended:
             is_market_order = True
             limit_p = price
         # Everything else = limit order (sniper mode)
@@ -798,7 +849,7 @@ async def analyze_hybrid_async(client, symbol):
         # Only generate signal if last 1m candle is >45s old (data nearly final)
         # Prevents acting on incomplete candle that may reverse before close
         last_candle_age = (now * 1000 - d1m['ot'].iloc[-1]) / 1000  # seconds
-        candle_too_young = last_candle_age < 15  # First 15s of candle = unreliable
+        candle_too_young = last_candle_age < 8  # First 8s of candle = unreliable
         
         # --- MOMENTUM CONFIRMATION (Anti-Falling-Knife) ---
         # Don't BUY into consecutive red candles, don't SHORT into consecutive green
@@ -806,8 +857,8 @@ async def analyze_hybrid_async(client, symbol):
         last5_opens = d1m['o'].tail(5).values
         consec_red = sum(1 for i in range(len(last5_closes)) if last5_closes[i] < last5_opens[i])
         consec_green = sum(1 for i in range(len(last5_closes)) if last5_closes[i] > last5_opens[i])
-        falling_knife = (direction == 1 and consec_red >= 4)  # 4/5 red candles = falling
-        rising_knife = (direction == -1 and consec_green >= 4)  # 4/5 green = pumping
+        falling_knife = (direction == 1 and consec_red >= 5)  # 5/5 red candles = falling
+        rising_knife = (direction == -1 and consec_green >= 5)  # 5/5 green = pumping
         
         # For reversal trades: knife/cascading is CONFIRMATION not blocker
         if is_reversal_trade:
@@ -817,31 +868,30 @@ async def analyze_hybrid_async(client, symbol):
         # Also check: is price making lower lows (for long) or higher highs (for short)?
         last3_lows = d1m['l'].tail(3).values
         last3_highs = d1m['h'].tail(3).values
-        cascading_down = (last3_lows[2] < last3_lows[1] < last3_lows[0]) and direction == 1 and not is_reversal_trade
-        cascading_up = (last3_highs[2] > last3_highs[1] > last3_highs[0]) and direction == -1 and not is_reversal_trade
+        # Cascading: only block if no strong reversal signal (VSA or liquidity sweep)
+        _vsa_check = MarketAnalyzer.detect_vsa_signals(d1m)
+        _sweep_check = MarketAnalyzer.detect_liquidity_sweep(d1m)
+        _has_reversal_signal = (_vsa_check == direction) or (_sweep_check == direction)
+        cascading_down = (last3_lows[2] < last3_lows[1] < last3_lows[0]) and direction == 1 and not is_reversal_trade and not _has_reversal_signal
+        cascading_up = (last3_highs[2] > last3_highs[1] > last3_highs[0]) and direction == -1 and not is_reversal_trade and not _has_reversal_signal
         
         # --- SELL/BUY PRESSURE FILTER ---
         # Block LONG if sellers dominate, block SHORT if buyers dominate
         last10 = d1m.tail(10)
         _sell_vol = last10[last10['c'] < last10['o']]['v'].sum()
         _buy_vol = last10[last10['c'] >= last10['o']]['v'].sum()
-        sell_pressure = (direction == 1 and _sell_vol > _buy_vol * 1.3) and not is_reversal_trade
-        buy_pressure = (direction == -1 and _buy_vol > _sell_vol * 1.3) and not is_reversal_trade
+        sell_pressure = (direction == 1 and _sell_vol > _buy_vol * 1.5) and not is_reversal_trade
+        buy_pressure = (direction == -1 and _buy_vol > _sell_vol * 1.5) and not is_reversal_trade
         
         # --- RSI MOMENTUM DECLINING FILTER ---
-        # Block LONG if RSI declining and below 50, block SHORT if RSI rising and above 50
-        _rsi_vals = MarketAnalyzer.get_rsi(d15m['c'], 14)
-        _rsi_now = _rsi_vals.iloc[-1]
-        _rsi_prev = _rsi_vals.iloc[-3] if len(_rsi_vals) >= 3 else _rsi_now
-        rsi_declining_long = (direction == 1 and _rsi_now < _rsi_prev and _rsi_now < 48) and not is_reversal_trade
-        rsi_rising_short = (direction == -1 and _rsi_now > _rsi_prev and _rsi_now > 52) and not is_reversal_trade
+        _rsi_now = rsi_15m
+        _rsi_prev = ind15m["rsi_prev"]
+        rsi_declining_long = (direction == 1 and _rsi_now < _rsi_prev and _rsi_now < 42) and not is_reversal_trade
+        rsi_rising_short = (direction == -1 and _rsi_now > _rsi_prev and _rsi_now > 58) and not is_reversal_trade
         
-        # --- EMA POSITION FILTER ---
-        # Penalize LONG if price below both EMA9+EMA21 on 1m (immediate bearish)
-        _ema9_pos = MarketAnalyzer.get_ema(d1m['c'], 9).iloc[-1]
-        _ema21_pos = MarketAnalyzer.get_ema(d1m['c'], 21).iloc[-1]
-        price_below_emas = (direction == 1 and price < _ema9_pos and price < _ema21_pos)
-        price_above_emas = (direction == -1 and price > _ema9_pos and price > _ema21_pos)
+        # --- EMA POSITION FILTER (reuse cached values) ---
+        price_below_emas = (direction == 1 and price < ema9_1m and price < ema21_1m)
+        price_above_emas = (direction == -1 and price > ema9_1m and price > ema21_1m)
         
         # Block entry if fake move or overextended
         if is_fake_move or is_overextended or candle_too_young:
@@ -855,21 +905,18 @@ async def analyze_hybrid_async(client, symbol):
         elif rsi_declining_long or rsi_rising_short:
             signal = "WAIT"  # Momentum fading against our direction
         # ML VETO: block entry if ML strongly disagrees with direction
-        elif (direction == 1 and ml_prob < 0.35) or (direction == -1 and ml_prob > 0.65):
-            signal = "WAIT"  # ML confidence >30% against direction = veto
+        elif (direction == 1 and ml_prob < 0.28) or (direction == -1 and ml_prob > 0.72):
+            signal = "WAIT"  # ML confidence >28% against direction = veto
         elif score >= threshold:
             # Limit order must be at a meaningful distance (not just chasing)
             if is_market_order:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-            elif dist >= 0.10 and dist <= 2.5:
+            elif dist >= 0.05 and dist <= 2.5:
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
-            elif dist < 0.10:
-                # Very close to level — market order for reversal, limit for trend
-                if is_reversal_trade:
-                    is_market_order = True
-                    limit_p = price
-                else:
-                    limit_p = price * (1 - 0.002) if direction == 1 else price * (1 + 0.002)
+            elif dist < 0.05:
+                # Very close to level — use market order for all cases
+                is_market_order = True
+                limit_p = price
                 signal = "SCALP-LONG" if direction == 1 else "SCALP-SHORT"
         
         result = {

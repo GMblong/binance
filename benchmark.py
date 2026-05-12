@@ -144,7 +144,7 @@ async def run_benchmark():
                     stats["superhuman_times"].append((time.time() - t_sh) * 1000)
                     
                     t_mi = time.time()
-                    micro_engine.compute(symbol)
+                    await micro_engine.compute(symbol, client=client)
                     stats["micro_times"].append((time.time() - t_mi) * 1000)
             
             # Progress

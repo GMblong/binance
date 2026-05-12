@@ -49,11 +49,11 @@ async def open_position_async(client: httpx.AsyncClient, symbol: str, side: str,
         kelly_mult = calculate_kelly_risk(symbol, win_rate=win_rate, rr=2.0)
         
         if ml_prob > 0.75 or ml_prob < 0.25:
-            risk_amt = base_risk * 1.2 * kelly_mult
+            risk_amt = base_risk * 1.5 * kelly_mult  # Very high conviction: 1.5x
         elif ml_prob >= 0.6 or ml_prob <= 0.4:
-            risk_amt = base_risk * kelly_mult
+            risk_amt = base_risk * 1.2 * kelly_mult  # High conviction: 1.2x
         else:
-            risk_amt = base_risk * 0.5 * kelly_mult
+            risk_amt = base_risk * 0.7 * kelly_mult  # Uncertain: 0.7x
 
         # --- CONFIDENCE DECAY: reduce size on recent losing streak ---
         recent = perf[-5:] if len(perf) >= 3 else []
@@ -311,8 +311,8 @@ async def manage_limit_orders(client, all_signals):
         now = time.time()
         for symbol, lo in list(bot_state["limit_orders"].items()):
             age = now - lo["timestamp"]
-            # Cancel stale limit orders after 90 seconds (scalping needs fast entry)
-            if age > 90:
+            # Cancel stale limit orders after 45 seconds (scalping needs fast entry)
+            if age > 45:
                 await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": lo["orderId"]})
                 del bot_state["limit_orders"][symbol]
                 bot_state["last_log"] = f"[dim]Cancelled stale limit for {symbol}[/]"
@@ -338,6 +338,14 @@ async def partial_close_async(client, symbol, side, full_amt, pct, reason, pnl):
         close_qty = round_step(abs(full_amt) * pct, prec["step"])
         if close_qty <= 0:
             return False
+        
+        # MIN_NOTIONAL Check: Binance requires ~$5-$20 depending on pair
+        mark_price = market_data.prices.get(symbol, 0)
+        notional = close_qty * mark_price
+        if notional < MIN_NOTIONAL_USD:
+            # If too small for partial, just skip or wait for full close
+            return False
+
         close_side = "SELL" if side == "LONG" else "BUY"
         res = await binance_request(client, 'POST', '/fapi/v1/order', {
             "symbol": symbol, "side": close_side, "type": "MARKET",
@@ -397,9 +405,9 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         
         reason = None
         
-        # === 1. PARTIAL TAKE PROFIT (40% at 0.6R for scalping) ===
-        if not ai.get("partial_done") and pnl_pct >= max(initial_sl * 0.6, 0.3):
-            did_partial = await partial_close_async(client, symbol, side, amt, 0.4, "TP1-SCALP", pnl_pct)
+        # === 1. PARTIAL TAKE PROFIT (50% at 0.5R for scalping) ===
+        if not ai.get("partial_done") and pnl_pct >= max(initial_sl * 0.5, 0.25):
+            did_partial = await partial_close_async(client, symbol, side, amt, 0.5, "TP1-SCALP", pnl_pct)
             if did_partial:
                 ai["partial_done"] = True
                 ai["be_active"] = True
@@ -430,8 +438,8 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         if k1m is not None and len(k1m) >= 14:
             live_atr = MarketAnalyzer.get_atr(k1m, 14).iloc[-1]
             live_atr_pct = (live_atr / current_price) * 100
-            # Callback = 0.5x current ATR, adjusted by ML and volatility
-            struct_cb = max(0.15, live_atr_pct * 0.5 * ml_adj * min(max(market_vol, 0.7), 1.5))
+            # Callback = 0.4x current ATR (tighter than before), adjusted by ML and volatility
+            struct_cb = max(0.12, live_atr_pct * 0.4 * ml_adj * min(max(market_vol, 0.7), 1.5))
         else:
             struct_cb = base_cb * min(max(market_vol, 0.5), 2.0) * ml_adj
         
@@ -458,15 +466,15 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
         
         # === 4. TIME DECAY - Exit stuck trades ===
         if not reason:
-            # Regime-based max hold time
-            max_hold = 30 if regime == "RANGING" else 60 if regime == "TRENDING" else 45
+            # Regime-based max hold time (scalping: much shorter)
+            max_hold = 15 if regime == "RANGING" else 25 if regime == "TRENDING" else 20
             if hold_minutes > max_hold:
                 if pnl_pct > 0.1:
                     reason = f"TIME-TP (Held {int(hold_minutes)}m, PnL:{pnl_pct:.2f}%)"
                 elif pnl_pct < -0.3 and hold_minutes > max_hold * 1.5:
                     reason = f"TIME-SL (Stuck {int(hold_minutes)}m, cutting loss)"
-            # Moderate decay: if barely moving after 15 min, reduce tolerance
-            elif hold_minutes > 15 and abs(pnl_pct) < 0.2:
+            # Moderate decay: if barely moving after 8 min, reduce tolerance
+            elif hold_minutes > 8 and abs(pnl_pct) < 0.2:
                 # Trade going nowhere - if ML now disagrees, exit
                 if curr_sig and "ai" in curr_sig:
                     ml_p = curr_sig["ai"].get("ml_prob", 0.5)
@@ -491,14 +499,14 @@ async def check_and_execute_exits(client, symbol, current_price, all_signals=[])
                     struct_break = True
             
             # Strong reversal: ML + direction flip + structure break
-            if side == "LONG" and sig_dir == -1 and ml_prob < 0.38 and struct_break:
+            if side == "LONG" and sig_dir == -1 and ml_prob < 0.40 and struct_break:
                 reason = "AI-REVERSAL (ML+STRUCT BEARISH)"
-            elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.62 and struct_break:
+            elif side == "SHORT" and sig_dir == 1 and ml_prob > 0.60 and struct_break:
                 reason = "AI-REVERSAL (ML+STRUCT BULLISH)"
             # Moderate reversal: ML disagrees strongly
-            elif side == "LONG" and ml_prob < 0.3 and pnl_pct < 0.5:
+            elif side == "LONG" and ml_prob < 0.32 and pnl_pct < 0.5:
                 reason = "AI-REVERSAL (ML STRONG BEARISH)"
-            elif side == "SHORT" and ml_prob > 0.7 and pnl_pct < 0.5:
+            elif side == "SHORT" and ml_prob > 0.68 and pnl_pct < 0.5:
                 reason = "AI-REVERSAL (ML STRONG BULLISH)"
             # Momentum dead with profit
             elif pnl_pct > 0.3:
@@ -678,10 +686,19 @@ async def manage_active_positions(client, all_signals):
             # 2. ORDER PROTECTION - use pre-fetched orders (no extra API call)
             symbol_orders = orders_by_symbol.get(symbol, [])
             symbol_algo = algo_by_symbol.get(symbol, [])
-            has_sl = (any(o['type'] in ['STOP_MARKET', 'STOP'] for o in symbol_orders) or
-                      any(o.get('orderType', o.get('type', '')) in ['STOP_MARKET', 'STOP'] for o in symbol_algo))
-            has_tp = (any(o['type'] in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_orders) or
-                      any(o.get('orderType', o.get('type', '')) in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT'] for o in symbol_algo))
+            
+            # Index existing SL/TP prices to avoid redundant updates
+            current_sl_px = 0.0
+            current_tp_px = 0.0
+            for o in (symbol_orders + symbol_algo):
+                o_type = o.get('type', o.get('orderType', ''))
+                if o_type in ['STOP_MARKET', 'STOP']:
+                    current_sl_px = float(o.get('stopPrice', o.get('triggerPrice', 0)))
+                elif o_type in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT']:
+                    current_tp_px = float(o.get('stopPrice', o.get('triggerPrice', 0)))
+
+            has_sl = current_sl_px > 0
+            has_tp = current_tp_px > 0
 
             # --- STRUCTURAL SL PROTECTION ---
             k1m = market_data.klines.get(symbol, {}).get("1m")
@@ -696,35 +713,54 @@ async def manage_active_positions(client, all_signals):
                     if ob and ob["top"] < entry_price:
                         struct_sl = ob["top"]
 
-            if not has_sl or not has_tp or struct_sl:
-                prec = await get_symbol_precision(client, symbol)
-                if not has_sl or struct_sl:
-                    if struct_sl:
-                        sl_price = round_step(struct_sl, prec["tick"])
-                    else:
-                        sl_mult = (1 - (ai.get("sl", 1.0)/100)) if side == "LONG" else (1 + (ai.get("sl", 1.0)/100))
-                        sl_price = round_step(entry_price * sl_mult, prec["tick"])
-                    
-                    if has_sl:
-                        sl_order = next(o for o in symbol_orders if o['type'] in ['STOP_MARKET', 'STOP'])
-                        await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": sl_order["orderId"]})
-                    
-                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
-                        "algoType": "CONDITIONAL",
-                        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
-                        "type": "STOP_MARKET", "triggerPrice": f"{sl_price:.{prec['p_prec']}f}",
-                        "closePosition": "true", "workingType": "MARK_PRICE"
-                    })
+            # Calculate target SL and TP
+            sl_mult = (1 - (ai.get("sl", 1.0)/100)) if side == "LONG" else (1 + (ai.get("sl", 1.0)/100))
+            target_sl_px = struct_sl if struct_sl else entry_price * sl_mult
+            
+            tp_mult = (1 + (ai.get("tp", 2.0)/100)) if side == "LONG" else (1 - (ai.get("tp", 2.0)/100))
+            target_tp_px = entry_price * tp_mult
+            
+            # --- API SPAM PREVENTION: Only update if change is > 0.1% ---
+            prec = await get_symbol_precision(client, symbol)
+            target_sl_px = round_step(target_sl_px, prec["tick"])
+            target_tp_px = round_step(target_tp_px, prec["tick"])
+            
+            sl_changed = abs(target_sl_px - current_sl_px) / (current_sl_px + 1e-12) > 0.001
+            tp_changed = abs(target_tp_px - current_tp_px) / (current_tp_px + 1e-12) > 0.001
 
-                if not has_tp:
-                    tp_mult = (1 + (ai.get("tp", 2.0)/100)) if side == "LONG" else (1 - (ai.get("tp", 2.0)/100))
-                    tp_price = round_step(entry_price * tp_mult, prec["tick"])
-                    await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
-                        "algoType": "CONDITIONAL",
-                        "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
-                        "type": "TAKE_PROFIT_MARKET", "triggerPrice": f"{tp_price:.{prec['p_prec']}f}",
-                        "closePosition": "true", "workingType": "MARK_PRICE"
-                    })
+            if not has_sl or sl_changed:
+                if has_sl:
+                    # Cancel existing SL
+                    sl_orders = [o for o in (symbol_orders + symbol_algo) if o.get('type', o.get('orderType', '')) in ['STOP_MARKET', 'STOP']]
+                    for so in sl_orders:
+                        oid = so.get('orderId')
+                        aid = so.get('algoId')
+                        if aid: await binance_request(client, 'DELETE', '/fapi/v1/algoOrder', {"symbol": symbol, "algoId": str(aid)})
+                        elif oid: await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": str(oid)})
+                
+                await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                    "algoType": "CONDITIONAL",
+                    "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY", 
+                    "type": "STOP_MARKET", "triggerPrice": f"{target_sl_px:.{prec['p_prec']}f}",
+                    "closePosition": "true", "workingType": "MARK_PRICE"
+                })
+
+            if not has_tp or tp_changed:
+                if has_tp:
+                    # Cancel existing TP
+                    tp_orders = [o for o in (symbol_orders + symbol_algo) if o.get('type', o.get('orderType', '')) in ['TAKE_PROFIT_MARKET', 'TAKE_PROFIT']]
+                    for to in tp_orders:
+                        oid = to.get('orderId')
+                        aid = to.get('algoId')
+                        if aid: await binance_request(client, 'DELETE', '/fapi/v1/algoOrder', {"symbol": symbol, "algoId": str(aid)})
+                        elif oid: await binance_request(client, 'DELETE', '/fapi/v1/order', {"symbol": symbol, "orderId": str(oid)})
+
+                await binance_request(client, 'POST', '/fapi/v1/algoOrder', {
+                    "algoType": "CONDITIONAL",
+                    "symbol": symbol, "side": "SELL" if side == "LONG" else "BUY",
+                    "type": "TAKE_PROFIT_MARKET", "triggerPrice": f"{target_tp_px:.{prec['p_prec']}f}",
+                    "closePosition": "true", "workingType": "MARK_PRICE"
+                })
 
             # 3. EXIT LOGIC (Fast Exit Engine)
             all_valid = all_signals

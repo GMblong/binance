@@ -23,7 +23,8 @@ from engine.multi_exchange import bybit_feed, okx_feed
 ticker_cache = {} # {symbol: last_data}
 
 # Dashboard render cache - avoid recalculating static elements
-_vp_cache = {}  # {symbol: (last_ot, vp_result)}
+_vp_cache = {}   # {symbol: (last_ot, vp_result)}
+_vsa_cache = {}  # {symbol: (last_ot, vsa_result)}
 _last_layout_cache = {"ts": 0, "layout": None}
 
 def generate_sparkline(prices):
@@ -38,7 +39,7 @@ def generate_sparkline(prices):
         res += chars[idx]
     return res
 
-async def generate_dashboard_async(client):
+async def generate_dashboard_async():
     try:
         # Use results from the background trading loop
         all_valid = bot_state.get("last_scan_results", [])
@@ -70,7 +71,9 @@ async def generate_dashboard_async(client):
                 table.add_row("", "", "", "[dim italic]Scanning market data...[/]", "", "", "")
                 return table
             
-            for r in data: 
+            for r in data:
+                if not r:
+                    continue
                 score_val = int(r.get("score", 0))
                 bar_length = score_val // 10
                 
@@ -80,7 +83,7 @@ async def generate_dashboard_async(client):
                 trend_col = "bold green" if is_bull else ("bold red" if r.get("dir", 0) == -1 else "dim white")
                 
                 # ML Probability with consensus indicator
-                ml_prob = r.get("ai", {}).get("ml_prob", 0.5)
+                ml_prob = (r.get("ai") or {}).get("ml_prob", 0.5)
                 ml_col = "bold green" if ml_prob > 0.65 else ("bold red" if ml_prob < 0.35 else "white")
                 # Consensus: if prob is far from 0.5, models likely agree
                 consensus = "◆" if (ml_prob > 0.7 or ml_prob < 0.3) else ("◇" if (ml_prob > 0.6 or ml_prob < 0.4) else " ")
@@ -173,7 +176,14 @@ async def generate_dashboard_async(client):
                         else: reasons.append("[bold red]BELOW POC[/]")
                     
                     if "1m" in market_data.klines[sym_full]:
-                        vsa_sig = MarketAnalyzer.detect_vsa_signals(market_data.klines[sym_full]["1m"])
+                        d1m_vsa = market_data.klines[sym_full]["1m"]
+                        _vsa_ot = float(d1m_vsa.iloc[-1]['ot']) if not d1m_vsa.empty else 0
+                        _vsa_cached = _vsa_cache.get(sym_full)
+                        if _vsa_cached and _vsa_cached[0] == _vsa_ot:
+                            vsa_sig = _vsa_cached[1]
+                        else:
+                            vsa_sig = MarketAnalyzer.detect_vsa_signals(d1m_vsa)
+                            _vsa_cache[sym_full] = (_vsa_ot, vsa_sig)
                         if vsa_sig != 0:
                             reasons.append(f"[bold yellow]VSA ({'BULL' if vsa_sig==1 else 'BEAR'})[/]")
 
@@ -235,8 +245,10 @@ async def generate_dashboard_async(client):
             # Safety: Skip if already showing in active positions
             if any(p['symbol'] == symbol for p in active_pos):
                 continue
+            if not lo:
+                continue
 
-            ai = lo.get("ai", {})
+            ai = lo.get("ai", {}) or {}
             side_col = "green" if lo['side'] == "BUY" else "red"
             side_str = "LONG" if lo['side'] == "BUY" else "SHORT"
             
@@ -401,8 +413,10 @@ async def generate_dashboard_async(client):
         )
         
         # Consolidate and sort movers by score (top 15)
-        combined_list = sorted(all_valid, key=lambda x: x.get('score', 0), reverse=True)[:12]
+        combined_list = [r for r in sorted(all_valid, key=lambda x: x.get('score', 0) if x else 0, reverse=True) if r][:12]
         layout["main"].update(create_combined_table("🔥 MARKET RADAR", combined_list))
         
         return layout
-    except Exception as e: return Panel(f"Error: {str(e)}")
+    except Exception as e:
+        import traceback
+        return Panel(f"[red]Dashboard Error:[/] {str(e)}\n[dim]{traceback.format_exc()[-300:]}[/]")
